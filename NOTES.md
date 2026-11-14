@@ -1,5 +1,38 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## >>> 2026-11-14 (later): the GPU is the wall at native; xnu 0164 built, waiting on CI <<<
+
+The 0016 line is closed: v1 18.4, v2 19.8, control 23.7 swaps/s, and `waits`/`cbs` = 1.01 in every
+boot. The client waits for the frame's own fence after every commit (passlog `cpu 9.63` vs
+`wall 9.58`, so not inside `-commit`), so nothing commit-side can overlap. 0016 stays, neutral.
+
+**The GPU, from the kernel's own 5 s line (`RedwoodGPU: the GPU worked ...`), one boot each:**
+
+| Boot | Size | GPU per submission | Submissions/s | Queue depth |
+| --- | --- | --- | --- | --- |
+| `0164c` | 1125x2436 | 23.8 ms | 52 | 1.24 (saturated) |
+| `0164e` | 750x1624 | 6.8 ms | 69 | 0.47 (half idle) |
+
+2.25x the pixels costs 4.6x the GPU time and 4x the cache cleaning, so the cost per pixel is worse
+at native: congestion, i.e. bandwidth, not slow code. Native frame = 9.5 replay + 23.8 GPU + 3.5-4.5
+panel copy + 5.8 walk/take, serial: 60 Hz needs roughly 3x less GPU work, no spacing trick can do it.
+
+**In flight: xnu patch `xnu/patches/0164-sweet-gpu-slack.patch`, CI run `43622291051` (`gpu`).**
+`gpu_slack=1` gives every imported surface a spare 64 KiB granule in the GPU's address window, mapped
+to one scratch page from the GPU pool, because a GMEM batch restores a target in 16x4 blocks and
+reads up to 3 rows past an IOSurface whose height is not a multiple of 4 (609 rows -> 612, 3456 bytes
+past a 704512-byte map). That over-fetch is the only reason native runs `sweetmetal_fddebug=sysmem`,
+i.e. with tiling switched off, and tiling is exactly the bandwidth lever left. Default off; the boot
+logs `RedwoodGPU: over-fetch slack (0164) at ...`.
+
+**Next, once the kernel is out of CI (two RAM boots, no flash, same payload `work1.raw`):**
+1. `0165a`: native, `sweetmetal_fddebug=sysmem` (same flags as `0164c`, kernel 0164) = control.
+2. `0165b`: native, **no** `sweetmetal_fddebug`, `gpu_slack=1` = GMEM for the first time at native.
+Compromise check first: the screen draws, no `SMMU`, no `FAR`, no `THE GPU DID NOT`; then
+swaps/s, `the GPU worked`, `waits`, `first cleans`, batches (`gmem` vs `sysmem`), queue depth.
+If GMEM wins, size the follow-up; if it loses, the next lever is the CPU at 2x or the ~100 blended
+draws a frame, and only then the upscale path.
+
 ## >>> 2026-11-14: native resolution measured; Metal 0016 built, waiting for a flash <<<
 
 Goal for this stretch: make the UI faster at **1125x2436** (native). The 750x1624 scaled path is
