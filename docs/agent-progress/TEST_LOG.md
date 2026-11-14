@@ -530,3 +530,16 @@ the CPU (5.87 replay + 4.70 panel copy + 0.98 take per frame) is what holds 57 f
 
 Consequence for the next boot: a GMEM (tiled) A/B at native is the only bandwidth lever left, and it
 needs the over-fetch that forced `sweetmetal_fddebug=sysmem` fixed first (`FPS_INVESTIGATION.md` 2).
+
+## GMEM at native with the slack page (xnu 0164, `gpu_slack=1`), 0165a control against 0165b, 2026-11-14 (RAM boots, same payload `work1.raw`, same flags as 0164c, no flash)
+
+| Date | Build | Procedure | Expected | Actual | Artifacts |
+| --- | --- | --- | --- | --- | --- |
+| 2026-11-14 | `shim-boot-0165a.img` (`d1ec818c...`), kernel 0164 (`6e7f0849...`), native, `sweetmetal_fddebug=sysmem` | `tools/sweet-boot-test.sh ... 0165a 420` | reproduce 0164c: ~20 swaps/s, 0 gmem | 20.8 swaps/s (170 active s, best 29), `batches 5.5/cb = sysmem 5.32 + gmem 0`, `waits 3740 mean 17098 us`, GPU 21.95 ms a submission (45 windows, 10743 submissions = 55.4/s), first cleans 762 of 309 MB | `logs/xnu-0165a.txt` |
+| 2026-11-14 | `shim-boot-0165b.img` (`a9d96eeb...`), same kernel, native, **no** `sweetmetal_fddebug`, `gpu_slack=1` | same | GMEM renders, no SMMU fault | **no fault at all** (0 SMMU lines), `RedwoodGPU: over-fetch slack (0164) at 0x1f1e00000`, `batches 6.4/cb = sysmem 4.19 + gmem 2.21`, passlog `500 batches: sysmem 322, gmem 160`, `bins 6414 (mean 40.1 per gmem batch)`, **21.4 swaps/s** (171 s), GPU **18.87 ms** a submission (12071 = 62.2/s), `waits 3762 mean 15865 us`, present 3181 us, cpu/cb 7.37 | `logs/xnu-0165b.txt` |
+
+Verdict: the 0165 over-fetch fault is gone -- the slack page works, GMEM runs at native for the first time, and it is a **real but small** win: GPU 21.95 -> 18.87 ms a submission (-14 %), submissions 55.4 -> 62.2/s (+12 %), swaps 20.8 -> 21.4 (+3 %, blocked elsewhere). Cost per pixel after tiling is 6.9 ns against 6.8 ns measured at 750x1624, so tiling removed essentially all of the superlinear congestion; what is left is the plain per-pixel cost of the draws themselves.
+
+Two things the same log says about the rest of the headroom:
+- Only **32 % of batches** are tiled. `fd_gmem_render_tiles` (mesa 25.0.7, `freedreno_gmem.c:725`) asks `fd_autotune_use_bypass()` per FBO key, and the autotuner decides to bypass for the others. `FD_DBG(GMEM)` overrides it, so `sweetmetal_fddebug=gmem` measures the ceiling with no code change.
+- The frame is 3.2 submissions per command buffer (`subs 12071` for `cbs 3769`), i.e. three flush points a frame, each paying a binning setup and a tile flush.
