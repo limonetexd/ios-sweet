@@ -1,23 +1,15 @@
-> State 2026-11-19 (records through `72f84fa`, 2026-11-14). Previous prompt (Phase A, kernel 0162) is done; its results are in `TEST_LOG.md` (0169pf, 0169sf).
-> - Valid baseline at native 1125x2436: 0165b = kernel 0164 + `gpu_slack=1`, no `sweetmetal_fddebug`: GPU 18.87 ms a submission, 21.4 swaps/s, 0 faults (one boot, `experimental`). Control 0165a (`sweetmetal_fddebug=sysmem`): 21.95 ms, 20.8 swaps/s.
-> - Sustained 60 is NOT reached. Native frame is serial: replay + GPU + panel copy + walk/take.
-> - The GMEM over-fetch fault is avoided either by `sweetmetal_fddebug=sysmem` (tiling off) or by `gpu_slack=1` (kernel 0164, default off). Never boot native without one of the two.
-> - Closed: 0016 commit-before-GPU-wait (neutral, kept). 750x1624 strip: destination bug fixed by 0163 (`144ba95`); no user-confirmed picture at that size yet, so 750x1624 numbers stay unconfirmed until the user sees the screen.
-> - Kernel 0164 is in `~/Developer/ios-sweet-work/kernel-0164`. Phone was last recorded in fastboot (check with `fastboot devices`), root `work1.raw`; nothing flashed.
-> - Read first: `NOTES.md` top section, then the last section of `TEST_LOG.md`.
-> - Trap: image builds need `PATH=$HOME/Developer/ios-sweet-work/bin:$PATH`; without it the script silently copies the old image. Check the printed sha256 is new and `rg -a -o 'NAME=[^ ]*' IMAGE` shows every boot-arg you added.
-> - Trap: with a second adb device attached, set `SWEET_SERIAL` for `tools/sweet-boot-test.sh` (`4e57214`).
-> - Summary of a log: `tools/sweet-boot-summary.sh TAG`.
+> State 2026-11-20 (records through the 0171t row of `TEST_LOG.md`).
+> - Best at native 1125x2436: 0171a/0171t = kernel 0164/0165 + `gpu_slack=1` + metal 0017 `sweetmetal_async=1`: 27.4-27.7 swaps/s, best second 51-52, 0 faults (one boot each, `experimental`, picture NOT yet confirmed by the user). Phone root = `work1.raw` + 0017 binaries (rollback `~/Developer/ios-sweet-work/root/rollback-0016`).
+> - True GPU time (xnu 0165 `gpu_ts=1`): ~21 ms of execution a frame (3.4 submissions x 7.2 ms), GPU busy only 37-63 %. Forced GMEM (0170g) loses: keep the autotuner.
+> - Kernel 0165 in `~/Developer/ios-sweet-work/kernel-0165/xnu-kernel`. CI `xnu` runs on `gpu` only by `gh workflow run xnu.yml --ref gpu`.
+> - Read first: `UPSTREAM_SURVEY-2026-11-19.md`, the last three sections of `TEST_LOG.md`.
+> - Traps: image builds need `PATH=$HOME/Developer/ios-sweet-work/bin:$PATH` and `bash tools/...`; check sha256 and `rg -a -o NAME=` in the image. `SWEET_SERIAL=f492cad9` for boot tests.
 
-# Next phase (lead: Fable or Opus): the tiling ceiling at native
+# Next phase (lead: Fable or Opus): GPU work per frame at native, and the idle 40 %
 
-Question: how much of the GPU time goes away if every batch is tiled? Only 32 % of batches are tiled in 0165b; the freedreno autotuner (`fd_autotune_use_bypass()`, mesa 25.0.7 `freedreno_gmem.c:725`) bypasses the rest. `sweetmetal_fddebug=gmem` forces tiling with no code change.
+0. Ask the user to look at one 0171a-style boot and confirm the picture (no tearing, no stale frames, apps open/close). Until then 0017 stays default off.
+1. Where the 21 ms goes: per-pass GPU time. Extend the passlog (metal 0013) or the 0165 timestamps to tag each submission with its pass (attachment size, draws, gmem/sysmem) and log the top passes per 5 s. Compare with HakiOS (`metal-measurements.md`: full-screen home pass 6-13 ms; luma_boost was 83 % of their GPU passes; wallpaper_freeze home 50 -> 92).
+2. The idle 40 %: what the GPU waits for between submissions (kernel flush 1.3 ms a submission, take 2.2 ms, present 3.4 ms; 3.4 submissions a frame = three flush points). Candidates from DC28088 (same phone): no per-submission cache cleans of imported surfaces (their 0174: ioctl 2400 -> 605 us), page-flip/GPU present copy.
+3. One change, one boot, record, stop.
 
-1. One RAM boot, tag `0170g`: same flags as 0165b plus `sweetmetal_fddebug=gmem`, kernel 0164, `gpu_slack=1`, same image environment as 0165b, with `sweetgpu_reboot` in the payload (rung: reversible, RAM only).
-2. Compromise check first: screen draws (the user confirms the picture), no `SMMU`, no `FAR`, no `THE GPU DID NOT`. Then GPU ms a submission, swaps/s, batches gmem vs sysmem, waits.
-3. Compare with 0165b. If forced GMEM wins: plan how to make the choice without the debug flag. If not: the next levers are the 3.2 submissions per command buffer (three flush points a frame) and the ~100 blended draws.
-4. Record a row in `TEST_LOG.md`, update `NOTES.md` top and this file, stop.
-
-Still open from earlier lists: whether `gpu_slack=1` and `sweet_surfclear_ms=0` become defaults in `tools/sweet-gpu-image.sh` (needs more than one boot each), and a thermal cap before `SWEET_CPUMAX=1` is used outside a test.
-
-Not in this phase: widgets, glyphs, masks, Control Centre.
+Still open: defaults for `gpu_slack=1`, `sweet_surfclear_ms=0`, `sweetmetal_async=1` (need more than one boot and the user's eye); thermal cap before `SWEET_CPUMAX=1`.
