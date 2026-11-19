@@ -1,0 +1,606 @@
+--- a/tools/mesa/air/air_metal.c
++++ b/tools/mesa/air/air_metal.c
+@@ -4138,6 +4138,22 @@
+       return -1;
+    }
+    return 0;
++}
++
++/*
++ * 0017: poll one rwa_flush fence: a zero timeout, and the fence is NOT released -- the
++ * caller still pays it with rwa_wait_fence, which returns at once once this said 1. The
++ * driver's completion thread polls with this so that it holds the library lock only for the
++ * poll and not for the two seconds a wait may take.
++ */
++int
++rwa_fence_done(struct rwa_device *device, void *fence_handle)
++{
++   struct pipe_fence_handle *fence = fence_handle;
++
++   if (!device || !fence)
++      return -1;
++   return device->screen->fence_finish(device->screen, NULL, fence, 0) ? 1 : 0;
+ }
+ 
+ int
+--- a/tools/mesa/air/air_metal.h
++++ b/tools/mesa/air/air_metal.h
+@@ -587,6 +587,12 @@
+ /* 0016: wait for one rwa_flush fence and release it. 0, or -1 and a sentence when the GPU
+  * did not finish in time. The fence is released either way. New in 0016. */
+ int rwa_wait_fence(struct rwa_device *device, void *fence, char *why, size_t why_size);
++
++/* 0017: whether one rwa_flush fence has signalled, without waiting and without releasing
++ * it: 1 when it has, 0 when not yet, -1 for no device or no fence. The fence stays the
++ * caller's, still to be paid with rwa_wait_fence (which then returns at once). New in 0017:
++ * absent in older libraries. */
++int rwa_fence_done(struct rwa_device *device, void *fence);
+ 
+ /* Whether rwa_render_draw and rwa_render_clear wait for the GPU themselves (off, the
+  * default) or return once the work is queued (on). With it on, a failure on the GPU is
+--- a/userland/src/redwoodmetal.m
++++ b/userland/src/redwoodmetal.m
+@@ -578,6 +578,7 @@
+ 	int (*passlog_read)(struct rwa_device *, struct rwa_passlog *, int);
+ 	int (*set_ubo_whole)(struct rwa_device *, int);       /* 0015; absent in older ones */
+ 	int (*flush)(struct rwa_device *, void **, char *, size_t);   /* 0016; absent in older */
++	int (*fence_done)(struct rwa_device *, void *);   /* 0017; absent in older ones */
+ 	int (*wait_fence)(struct rwa_device *, void *, char *, size_t);/* 0016; absent in older */
+ } mesa;
+ 
+@@ -653,6 +654,9 @@
+ 	 * absent in an older library, and then -commit waits as it did before 0016 */
+ 	*(void **)&mesa.flush = dlsym(mesa.handle, "rwa_flush");
+ 	*(void **)&mesa.wait_fence = dlsym(mesa.handle, "rwa_wait_fence");
++	/* 0017: the poll the completion thread uses; absent in an older library, and then
++	 * sweetmetal_async=1 is ignored and says so */
++	*(void **)&mesa.fence_done = dlsym(mesa.handle, "rwa_fence_done");
+ 	if (mesa.device_open == NULL || mesa.compute_create == NULL || mesa.dispatch == NULL ||
+ 	    mesa.texture_create == NULL || mesa.sampler_create == NULL) {
+ 		/* rwa_dispatch's arguments changed when textures were added to the contract, so
+@@ -1036,6 +1040,8 @@
+ - (id)device;
+ /* 0016: pay a fence -commit deferred. NO when the GPU did not finish the work. */
+ - (BOOL)redwoodPayFence;
++/* 0017: what the completion thread does with one buffer it took off the FIFO */
++- (void)redwoodAsyncComplete;
+ @end
+ 
+ @interface RedwoodMetalComputeEncoder : _MTLCommandEncoder
+@@ -1475,6 +1481,149 @@
+ 				  "waits for the GPU (this library has no rwa_flush)");
+ 	});
+ 	return enabled;
++}
++
++/*
++ * 0017 "async": boot-arg sweetmetal_async=1 hands a pipelined command buffer (0016) to one
++ * process-wide completion thread instead of paying its fence in the next -commit or in the
++ * delivery of its own completed handlers. The thread polls the fence (rwa_fence_done) with
++ * the library lock held only for the poll, pays it, and delivers the completed handlers, in
++ * commit order. Without the boot-arg nothing below runs and nothing is said. It needs 0016's
++ * pipelined commit and a library with rwa_fence_done; without either it is ignored, said once.
++ *
++ * Locks: rw_async_mutex and rw_lib_lock are never nested, in either order; rw_async_mutex is
++ * never held while a handler runs.
++ */
++#define RW_ASYNC_KEY "sweetmetal_async="
++#define RW_ASYNC_BOUND 3                          /* buffers on the FIFO before -commit waits */
++#define RW_ASYNC_POLL_US 200
++#define RW_ASYNC_GIVEUP_NS (2ull * 1000 * 1000 * 1000)
++#define RW_ASYNC_PRINT_NS (5ull * 1000 * 1000 * 1000)   /* passlog's cadence */
++
++static pthread_mutex_t rw_async_mutex = PTHREAD_MUTEX_INITIALIZER;
++static pthread_cond_t rw_async_work = PTHREAD_COND_INITIALIZER;    /* the FIFO gained one */
++static pthread_cond_t rw_async_space = PTHREAD_COND_INITIALIZER;   /* left the FIFO / finished */
++/* everything below is guarded by rw_async_mutex */
++static NSMutableArray *rw_async_fifo;   /* retained command buffers, commit order */
++static bool rw_async_started;
++static pthread_t rw_async_thread;
++static uint64_t rw_async_t0, rw_async_done, rw_async_us, rw_async_polls, rw_async_boundwaits;
++
++static bool
++rw_async_on(void)
++{
++	static dispatch_once_t once;
++	static bool enabled;
++
++	dispatch_once(&once, ^{
++		char args[1024] = "";
++		size_t size = sizeof(args) - 1;
++		const char *at = NULL;
++
++		if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0) {
++			for (at = args; (at = strstr(at, RW_ASYNC_KEY)) != NULL;
++			     at += strlen(RW_ASYNC_KEY)) {
++				if (at == args || at[-1] == ' ') {
++					break;
++				}
++			}
++		}
++		if (at == NULL || at[strlen(RW_ASYNC_KEY)] != '1') {
++			return;   /* off: today's behaviour, and today's log */
++		}
++		if (mesa.fence_done == NULL) {
++			rw_print("GPU completion: sweetmetal_async=1 is ignored: this library has no "
++				 "rwa_fence_done (older than 0017)\n");
++		} else if (!rw_wait_per_commit() || !rw_commit_no_wait()) {
++			rw_print("GPU completion: sweetmetal_async=1 is ignored: it needs the pipelined "
++				 "commit (0016), which is off\n");
++		} else {
++			enabled = true;
++			rw_print("GPU completion: completed handlers are delivered by a completion "
++				 "thread (sweetmetal_async=1); -commit does not wait for the GPU\n");
++		}
++	});
++	return enabled;
++}
++
++static bool
++rw_async_on_thread(void)
++{
++	bool on;
++
++	pthread_mutex_lock(&rw_async_mutex);
++	on = rw_async_started && pthread_equal(rw_async_thread, pthread_self());
++	pthread_mutex_unlock(&rw_async_mutex);
++	return on;
++}
++
++static void *
++rw_async_main(void *arg)
++{
++	(void)arg;
++	for (;;) {
++		@autoreleasepool {
++			id buffer;
++
++			pthread_mutex_lock(&rw_async_mutex);
++			while ([rw_async_fifo count] == 0) {
++				pthread_cond_wait(&rw_async_work, &rw_async_mutex);
++			}
++			buffer = [[rw_async_fifo objectAtIndex:0] retain];
++			[rw_async_fifo removeObjectAtIndex:0];
++			pthread_cond_broadcast(&rw_async_space);
++			pthread_mutex_unlock(&rw_async_mutex);
++			[buffer redwoodAsyncComplete];
++			[buffer release];
++		}
++	}
++	return NULL;
++}
++
++/* With rw_async_mutex held. false when the thread could not be made (said once). */
++static bool
++rw_async_start_locked(void)
++{
++	pthread_attr_t attr;
++	int rc;
++
++	if (rw_async_started) {
++		return true;
++	}
++	if (rw_async_fifo == nil) {
++		rw_async_fifo = [[NSMutableArray alloc] init];
++	}
++	pthread_attr_init(&attr);
++	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
++	pthread_attr_set_qos_class_np(&attr, QOS_CLASS_USER_INTERACTIVE, 0);
++	rc = pthread_create(&rw_async_thread, &attr, rw_async_main, NULL);
++	pthread_attr_destroy(&attr);
++	if (rc != 0) {
++		RW_ONCE("GPU completion: no completion thread (pthread_create %d); each async "
++			"command buffer is completed inside its own -commit\n", rc);
++		return false;
++	}
++	rw_async_started = true;
++	rw_async_t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++	return true;
++}
++
++/* -commit, before the replay and outside the library lock: at most RW_ASYNC_BOUND buffers on
++ * the FIFO. Not on the completion thread, which is the one that empties it. */
++static void
++rw_async_bound(void)
++{
++	if (rw_async_on_thread()) {
++		return;
++	}
++	pthread_mutex_lock(&rw_async_mutex);
++	if ([rw_async_fifo count] >= RW_ASYNC_BOUND) {
++		rw_async_boundwaits++;
++		while ([rw_async_fifo count] >= RW_ASYNC_BOUND) {
++			pthread_cond_wait(&rw_async_space, &rw_async_mutex);
++		}
++	}
++	pthread_mutex_unlock(&rw_async_mutex);
+ }
+ 
+ /*
+@@ -4864,6 +5013,9 @@
+ 	 * next -commit pays it before it replays, so that a frame costs the larger of the
+ 	 * CPU's part and the GPU's part instead of the sum of the two. */
+ 	id _pending;
++	/* 0017: buffers of this queue handed to the completion thread and not yet finished
++	 * there (handlers delivered). Guarded by rw_async_mutex. */
++	NSUInteger _asyncInFlight;
+ }
+ 
+ - (instancetype)initWithRedwoodDevice:(RedwoodMetalDevice *)device descriptor:(id)descriptor
+@@ -4932,6 +5084,15 @@
+ 	}
+ 	_pending = nil;
+ 	[buffer release];   /* the caller of -redwoodPayFence still holds the buffer */
++}
++
++/* 0017: with rw_async_mutex held */
++- (void)redwoodAsyncEnqueuedLocked { _asyncInFlight++; }
++- (void)redwoodAsyncFinishedLocked
++{
++	if (_asyncInFlight > 0) {
++		_asyncInFlight--;
++	}
+ }
+ 
+ - (void)redwoodSetPending:(id)buffer
+@@ -5093,6 +5254,14 @@
+ 		[pending redwoodPayFence];
+ 		[pending release];
+ 	}
++	/* 0017: the buffers handed to the completion thread are finished first (fence paid,
++	 * handlers delivered). Each of them holds this queue, so this finds none; it is the
++	 * order for a future that breaks that reference. */
++	pthread_mutex_lock(&rw_async_mutex);
++	while (_asyncInFlight > 0) {
++		pthread_cond_wait(&rw_async_space, &rw_async_mutex);
++	}
++	pthread_mutex_unlock(&rw_async_mutex);
+ 	/* Only the copy this driver keeps itself: the one in Apple's ivar belongs to
+ 	 * -[_MTLCommandQueue dealloc], and releasing it twice would be worse than leaking
+ 	 * one dispatch queue in the Metal where that dealloc does not. */
+@@ -5155,6 +5324,15 @@
+ 	 * again and end the next batch early. */
+ 	BOOL _fenceDue;
+ 	void *_fence;
++	/* 0017: set with _fenceDue, under the library lock, when the fence is the completion
++	 * thread's to pay; never cleared. _asyncCommitter is the thread inside that -commit. */
++	BOOL _asyncOwned;
++	pthread_t _asyncCommitter;
++	/* 0017, guarded by rw_async_mutex: on the FIFO; somebody is paying the fence (exactly
++	 * one: whoever set it); the fence is paid; the completed handlers were taken for delivery */
++	BOOL _asyncQueued, _asyncTaken, _asyncPaid, _asyncHandlersTaken;
++	uint64_t _asyncT0;            /* when -commit handed it over */
++	pthread_cond_t _asyncCond;    /* broadcast when _asyncPaid becomes YES */
+ }
+ 
+ /*
+@@ -5218,6 +5396,7 @@
+ 		(unsigned)RW_CB_COMPLETED, (unsigned)RW_CB_ERROR);
+ 	_status = RW_CB_ENQUEUED;   /* nothing is pending yet */
+ 	_owesSlot = YES;
++	pthread_cond_init(&_asyncCond, NULL);
+ 	[queue redwoodTookSlot];
+ 	return self;
+ }
+@@ -5252,6 +5431,7 @@
+ 	[_scheduled release];
+ 	[_completed release];
+ 	[_queue release];
++	pthread_cond_destroy(&_asyncCond);
+ 	[super dealloc];
+ }
+ 
+@@ -5322,6 +5502,11 @@
+ 		return;
+ 	}
+ 	_status = RW_CB_COMMITTED;
++	/* 0017: at most RW_ASYNC_BOUND buffers wait for the completion thread; the wait is
++	 * here, before the replay and outside the library lock */
++	if (rw_async_on()) {
++		rw_async_bound();
++	}
+ 	/* The whole replay under the library's lock: the context keeps the framebuffer, the
+ 	 * bound pipeline and the current batch between calls, so another command buffer's draws
+ 	 * must not land between this one's (xnu-0160vA line 4447: two commits inside
+@@ -5337,6 +5522,9 @@
+ 	/* 0016: whether this commit may return before the fence. Only with 0011's one-wait
+ 	 * (once), because 0016 defers that same wait rather than moving per-draw waits. */
+ 	bool pipelined = once && rw_commit_no_wait();
++	/* 0017: the fence goes to the completion thread instead of the next commit */
++	bool async = pipelined && rw_async_on();
++	bool asyncOwned = false;
+ 	bool queued = false;
+ 	/* 0013 passlog: nothing below is touched unless it is on */
+ 	bool passlog = rw_passlog_on();
+@@ -5364,9 +5552,11 @@
+ 		 *
+ 		 * The recording between the two commits was the CPU's half of the overlap: a
+ 		 * frame now costs the larger of CPU and GPU instead of the sum. */
+-		previous = [_queue redwoodTakePending];
+-		if (previous != nil) {
+-			[previous redwoodPayFenceLocked];
++		if (!async) {
++			previous = [_queue redwoodTakePending];
++			if (previous != nil) {
++				[previous redwoodPayFenceLocked];
++			}
+ 		}
+ 	}
+ 	for (RedwoodMetalWork *work in _work) {
+@@ -5459,7 +5649,16 @@
+ 				if (rc == 0) {
+ 					_fenceDue = YES;
+ 					_fence = fence;
+-					[_queue redwoodSetPending:self];
++					if (async) {
++						/* 0017: the completion thread's to pay, never
++						 * the next commit's: set under this lock, which is
++						 * where -redwoodPayFence reads it */
++						_asyncOwned = YES;
++						_asyncCommitter = pthread_self();
++						asyncOwned = true;
++					} else {
++						[_queue redwoodSetPending:self];
++					}
+ 				} else {
+ 					/* A library that says "no submission" may still have submitted:
+ 					the wait is what makes the failure safe, so _work is not let go
+@@ -5495,7 +5694,7 @@
+ 	 *
+ 	 * 0016: not when the fence is still owed. Then the GPU is reading it, and it goes in
+ 	 * the thread and the order -redwoodPayFenceLocked names instead. */
+-	if (!_fenceDue) {
++	if (!asyncOwned && !_fenceDue) {
+ 		[_work removeAllObjects];
+ 	}
+ 	/* The queue's slot goes back here and on every way out of this method, a failed draw
+@@ -5512,6 +5711,15 @@
+ 		[previous redwoodDeliverHandlers];
+ 		[previous release];
+ 	}
++	if (asyncOwned) {
++		/* 0017: scheduled handlers here, as before, and before the hand-over so that
++		 * they come before the completed ones; the completed ones are the completion
++		 * thread's. A scheduled handler that waits for this buffer pays the fence
++		 * itself (-redwoodAsyncWait), since it is not on the FIFO yet. */
++		[self redwoodDeliverScheduled];
++		[self redwoodAsyncEnqueue];
++		return;
++	}
+ 	/* and only then the handlers, so that a handler which makes the next command buffer
+ 	 * is not waiting for a slot this one still holds */
+ 	[self redwoodDeliverHandlers];
+@@ -5789,11 +5997,19 @@
+ 
+ - (BOOL)redwoodPayFence
+ {
+-	BOOL ok;
++	BOOL ok = NO;
++	BOOL owned;
+ 
+ 	rw_lib_lock();
+-	ok = [self redwoodPayFenceLocked];
++	/* 0017: a fence the completion thread owns is not paid here: never two payers */
++	owned = _asyncOwned;
++	if (!owned) {
++		ok = [self redwoodPayFenceLocked];
++	}
+ 	rw_lib_unlock();
++	if (owned) {
++		return [self redwoodAsyncWait];
++	}
+ 	/* A fence paid here is not paid again by the next commit, so if this buffer is the
+ 	 * one the queue is holding it can be let go now: an application that stops committing
+ 	 * after waiting would otherwise keep the queue, this buffer and what its work named
+@@ -5802,8 +6018,182 @@
+ 		[_queue redwoodClearPending:self];
+ 	}
+ 	return ok;
++}
++
++/*
++ * 0017: poll this buffer's fence, then pay it. Called by exactly one thread per buffer: the
++ * one that set _asyncTaken under rw_async_mutex. The library lock is held for each poll and
++ * for the pay, never across the sleep. After RW_ASYNC_GIVEUP_NS the pay is made anyway: it is
++ * -redwoodPayFenceLocked's own wait and its own "THE GPU DID NOT FINISH" failure.
++ */
++- (void)redwoodAsyncPay
++{
++	struct rwa_device *device = [[_queue device] mesaDevice];
++	uint64_t start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++	uint64_t polls = 0, now;
++
++	for (;;) {
++		int done;
++
++		rw_lib_lock();
++		done = device != NULL && _fence != NULL ? mesa.fence_done(device, _fence) : 1;
++		rw_lib_unlock();
++		polls++;
++		if (done != 0) {
++			break;   /* signalled, or nothing to poll: the pay below decides */
++		}
++		if (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - start >= RW_ASYNC_GIVEUP_NS) {
++			break;
++		}
++		usleep(RW_ASYNC_POLL_US);
++	}
++	rw_lib_lock();
++	[self redwoodPayFenceLocked];   /* returns at once for a signalled fence */
++	rw_lib_unlock();
++	now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++	pthread_mutex_lock(&rw_async_mutex);
++	_asyncPaid = YES;
++	rw_async_polls += polls;
++	if (_asyncT0 != 0 && now > _asyncT0) {
++		rw_async_us += (now - _asyncT0) / 1000;   /* 0 when paid before the hand-over */
++	}
++	pthread_cond_broadcast(&_asyncCond);
++	pthread_mutex_unlock(&rw_async_mutex);
++}
++
++/*
++ * 0017: -waitUntilCompleted on a buffer the completion thread owns. Waits for the payer, and
++ * pays only where waiting could never end: on the completion thread itself (a handler there
++ * waiting for a later buffer), or on the committing thread before the buffer reached the FIFO
++ * (a scheduled handler waiting for its own buffer). _asyncTaken keeps it to one payer.
++ */
++- (BOOL)redwoodAsyncWait
++{
++	BOOL pay = NO;
++	BOOL self_only = rw_async_on_thread();
++
++	pthread_mutex_lock(&rw_async_mutex);
++	if (!_asyncTaken &&
++	    (self_only || (!_asyncQueued && pthread_equal(_asyncCommitter, pthread_self())))) {
++		_asyncTaken = YES;
++		pay = YES;
++	}
++	if (!pay) {
++		while (!_asyncPaid) {
++			pthread_cond_wait(&_asyncCond, &rw_async_mutex);
++		}
++	}
++	pthread_mutex_unlock(&rw_async_mutex);
++	if (pay) {
++		[self redwoodAsyncPay];
++	}
++	return _status != RW_CB_ERROR;
++}
++
++/* 0017: the end of an async -commit, after the scheduled handlers: onto the FIFO. Without a
++ * completion thread the buffer is completed here instead, as the thread would. */
++- (void)redwoodAsyncEnqueue
++{
++	bool started;
++
++	pthread_mutex_lock(&rw_async_mutex);
++	started = rw_async_start_locked();
++	_asyncT0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++	[_queue redwoodAsyncEnqueuedLocked];
++	if (started) {
++		_asyncQueued = YES;
++		[rw_async_fifo addObject:self];
++		pthread_cond_signal(&rw_async_work);
++	}
++	pthread_mutex_unlock(&rw_async_mutex);
++	if (!started) {
++		[self redwoodAsyncComplete];
++	}
+ }
+ 
++/* 0017: one buffer off the FIFO, on the completion thread: pay the fence unless a waiter
++ * already is, then deliver the completed handlers, then count it finished. */
++- (void)redwoodAsyncComplete
++{
++	BOOL pay;
++	NSArray *completed;
++	uint64_t now, done = 0, us = 0, polls = 0, waits = 0, span = 0;
++	bool print = false;
++
++	pthread_mutex_lock(&rw_async_mutex);
++	pay = !_asyncTaken;
++	_asyncTaken = YES;
++	pthread_mutex_unlock(&rw_async_mutex);
++	if (pay) {
++		[self redwoodAsyncPay];
++	}
++	pthread_mutex_lock(&rw_async_mutex);
++	while (!_asyncPaid) {
++		pthread_cond_wait(&_asyncCond, &rw_async_mutex);
++	}
++	completed = _completed;
++	_completed = nil;
++	_asyncHandlersTaken = YES;
++	pthread_mutex_unlock(&rw_async_mutex);
++	for (id handler in completed) {
++		[self redwoodDeliver:(void (^)(id))handler];
++	}
++	[completed release];
++	now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++	pthread_mutex_lock(&rw_async_mutex);
++	_asyncQueued = NO;
++	[_queue redwoodAsyncFinishedLocked];
++	rw_async_done++;
++	if (now - rw_async_t0 >= RW_ASYNC_PRINT_NS) {
++		print = true;
++		span = now - rw_async_t0;
++		done = rw_async_done;
++		us = rw_async_us;
++		polls = rw_async_polls;
++		waits = rw_async_boundwaits;
++		rw_async_t0 = now;
++		rw_async_done = rw_async_us = rw_async_polls = rw_async_boundwaits = 0;
++	}
++	pthread_cond_broadcast(&rw_async_space);
++	pthread_mutex_unlock(&rw_async_mutex);
++	if (print) {
++		rw_print("async: %.1f s, %llu buffers completed, mean %.0f us commit to completion, "
++			 "%.2f polls per buffer, %llu commits waited for the bound of %d\n",
++			 (double)span / 1e9, (unsigned long long)done,
++			 done ? (double)us / (double)done : 0.0,
++			 done ? (double)polls / (double)done : 0.0,
++			 (unsigned long long)waits, RW_ASYNC_BOUND);
++	}
++}
++
++/* 0017: a completed handler added after -commit to a buffer the completion thread owns: kept
++ * for the thread to deliver while it has not taken the list, else (already completed)
++ * delivered now. NO when the buffer is not the thread's. */
++- (BOOL)redwoodAsyncAddCompleted:(void (^)(id))handler
++{
++	BOOL owned, kept = NO;
++
++	rw_lib_lock();
++	owned = _asyncOwned;
++	rw_lib_unlock();
++	if (!owned) {
++		return NO;
++	}
++	pthread_mutex_lock(&rw_async_mutex);
++	if (!_asyncHandlersTaken) {
++		if (_completed == nil) {
++			_completed = [[NSMutableArray alloc] init];
++		}
++		[_completed addObject:[[handler copy] autorelease]];
++		kept = YES;
++	}
++	pthread_mutex_unlock(&rw_async_mutex);
++	if (!kept) {
++		[self redwoodDeliver:handler];
++	}
++	return YES;
++}
++
+ - (void)waitUntilCompleted
+ {
+ 	if (_status == RW_CB_ERROR) {
+@@ -5876,6 +6266,9 @@
+ 		 * pipelined commit returns at Scheduled and owes it -- so a completed handler
+ 		 * added after the fact pays the fence before it runs, rather than reading a
+ 		 * status that is only a submission. */
++		if ([self redwoodAsyncAddCompleted:handler]) {
++			return;   /* 0017 */
++		}
+ 		[self waitUntilCompleted];
+ 		[self redwoodDeliver:handler];
+ 		return;
+@@ -5886,6 +6279,18 @@
+ 	[_completed addObject:[[handler copy] autorelease]];
+ }
+ 
++/* 0017: only the scheduled handlers; the completion thread delivers the completed ones */
++- (void)redwoodDeliverScheduled
++{
++	NSArray *scheduled = _scheduled;
++
++	_scheduled = nil;
++	for (id handler in scheduled) {
++		[self redwoodDeliver:(void (^)(id))handler];
++	}
++	[scheduled release];
++}
++
+ /* Called from the one place the work is done. The order is Metal's: scheduled first, then
+  * the fence, then completed. */
+ - (void)redwoodDeliverHandlers
