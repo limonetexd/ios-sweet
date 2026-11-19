@@ -1,3 +1,5 @@
+> **Historical (2026-11-03), kept for reference.** Current state: `docs/agent-progress/PROJECT_STATE.md`, next step: `docs/agent-progress/NEXT_PROMPT.md`, rules: `CLAUDE.md` and `AGENTS.md`. Do not work from this file. Its "blocker is `launchd`" finding is past: the home screen was reached on 2026-11-11.
+
 # Agent notes index — 2026-11-03
 
 Five read-only documentation agents, **48.694 words** total. These are raw working notes, not a

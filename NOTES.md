@@ -1,6 +1,6 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
-## >>> 2026-11-14 (later): the GPU is the wall at native; xnu 0164 built, waiting on CI <<<
+## >>> 2026-11-14 (later): the GPU is the wall at native; xnu 0164 built, booted as 0165a/0165b (results: `TEST_LOG.md` last section) <<<
 
 The 0016 line is closed: v1 18.4, v2 19.8, control 23.7 swaps/s, and `waits`/`cbs` = 1.01 in every
 boot. The client waits for the frame's own fence after every commit (passlog `cpu 9.63` vs

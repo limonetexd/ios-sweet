@@ -1,3 +1,5 @@
+> **Historical (2026-11-07), kept for reference.** Current state: `docs/agent-progress/PROJECT_STATE.md`, next step: `docs/agent-progress/NEXT_PROMPT.md`, rules: `CLAUDE.md` and `AGENTS.md`. Do not work from this file.
+
 # Roadmap horizon C: Wi-Fi and hardware (written 2026-11-07)
 
 Part of `ROADMAP-2026-11-07.md` (read its sections 1-3 first). Work here after horizon A is done and B's

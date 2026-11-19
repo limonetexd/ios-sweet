@@ -1,3 +1,5 @@
+> **Historical (2026-11-06), kept for reference.** Current state: `docs/agent-progress/PROJECT_STATE.md`, next step: `docs/agent-progress/NEXT_PROMPT.md`, rules: `CLAUDE.md` and `AGENTS.md`. Do not work from this file.
+
 # Prompt for DeepSeek (opencode): next HakiOS implementation round (written 2026-11-06)
 
 > **SUPERSEDED 2026-11-07** by `PROMPT-2026-11-07-roadmap.md` and `ROADMAP-2026-11-07*.md`; kept for history. Stale here:

@@ -1,4 +1,4 @@
-> Historical (2026-11-03). Current state and plan: `HANDOFF.md` and `ROADMAP-2026-11-07.md` (this folder).
+> **Historical (2026-11-03), kept for reference.** Current state: `docs/agent-progress/PROJECT_STATE.md`, next step: `docs/agent-progress/NEXT_PROMPT.md`, rules: `CLAUDE.md` and `AGENTS.md`. Do not work from this file.
 
 # DEEPSEEK — Handoff personal
 

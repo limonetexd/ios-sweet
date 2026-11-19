@@ -1,3 +1,5 @@
+> **Historical (2026-11-07), kept for reference.** Current state: `docs/agent-progress/PROJECT_STATE.md`, next step: `docs/agent-progress/NEXT_PROMPT.md`, rules: `CLAUDE.md` and `AGENTS.md`. Do not work from this file. The board is frozen as of 2026-11-07; later work is tracked in `docs/agent-progress/`. The model budget below is still the user's rule for opencode agents.
+
 # ROADMAP status board (started 2026-11-07)
 
 One line per task. Change only the Status, Updated and Evidence cells; never edit the roadmap cards for status.
