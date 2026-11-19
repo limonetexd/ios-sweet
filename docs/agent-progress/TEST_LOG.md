@@ -543,3 +543,11 @@ Verdict: the 0165 over-fetch fault is gone -- the slack page works, GMEM runs at
 Two things the same log says about the rest of the headroom:
 - Only **32 % of batches** are tiled. `fd_gmem_render_tiles` (mesa 25.0.7, `freedreno_gmem.c:725`) asks `fd_autotune_use_bypass()` per FBO key, and the autotuner decides to bypass for the others. `FD_DBG(GMEM)` overrides it, so `sweetmetal_fddebug=gmem` measures the ceiling with no code change.
 - The frame is 3.2 submissions per command buffer (`subs 12071` for `cbs 3769`), i.e. three flush points a frame, each paying a binning setup and a tile flush.
+
+## Forced GMEM at native (`sweetmetal_fddebug=gmem`), 0170g against 0165b, 2026-11-19 (RAM boot, payload `work1.raw`, kernel 0164, no flash)
+
+| Date | Build | Procedure | Expected | Actual | Artifacts |
+| --- | --- | --- | --- | --- | --- |
+| 2026-11-19 | `shim-boot-0170g.img` (`00a66754...`), kernel 0164, native, 60 Hz, 0165b flags + `sweetmetal_fddebug=gmem` | `SWEET_SERIAL=f492cad9 tools/sweet-boot-test.sh ... 0170g 420` (back in fastboot after 335 s) | every batch tiled; less GPU time than 0165b | 0 SMMU/FAR/`THE GPU DID NOT` lines; `batches 13.2/cb = sysmem 0 + gmem 13.2` (0165b 6.4), `bins 9024 (mean 17.8 per gmem batch)`, cpu/cb **12.73 ms** (7.37), subs 18780 (12071), submission latency **23.10 ms** (18.87), waits mean 15566 us, **19.7 swaps/s** (21.4), best second 42 | `logs/xnu-0170g.txt` |
+
+Verdict (one boot, `experimental`): forcing GMEM is worse on every number. The autotuner's bypass is right for the small batches; forcing them doubles the batches per command buffer and the CPU per command buffer. Closed: keep the autotuner. Picture not confirmed by the user on this boot. Next measurement is true GPU execution time (xnu 0165 `gpu_ts=1`, `SPEC-0165-gpu-timestamps.md`), because "the GPU worked" is a queueing latency, not GPU busy time.

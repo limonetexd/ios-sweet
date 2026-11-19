@@ -1,0 +1,278 @@
+From: HakiOS
+Subject: [PATCH 0165] sweet gpu: GPU timestamps of each submission (gpu_ts=1)
+
+
+"The GPU worked N us" is ring write to the first poll that sees the fence: it
+includes queueing behind earlier submissions and the poll delay, so it cannot
+say whether the GPU is saturated or what one submission costs on the GPU.
+
+With gpu_ts=1 every submission gets CP_REG_TO_MEM of CP_ALWAYS_ON_COUNTER
+(0x980, Linux a6xx get_stats_counter) before its IBs and CP_EVENT_WRITE
+RB_DONE_TS|TIMESTAMP (mesa fd6_record_ts) after them, into a 16-byte slot at
++0x100 of the fence page (64 slots, inside the 4 KiB already mapped at GPU VA
+0x10020000). Every five seconds: "RedwoodGPU: GPU timestamps (0165): busy B us
+of S us (P %), exec E us mean over N submissions, counter T ticks in U us",
+where busy excludes the time a submission queued behind the previous one and
+the last pair gives the counter's real rate. Off by default: the ring words
+are unchanged without the boot-arg.
+---
+diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+index cf4895a..c9e90dd 100644
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -74,6 +74,8 @@ extern uint32_t gpu_log;
+ bool redwood_gpu_done(uint32_t fence);
+ uint32_t redwood_gpu_last(void);
+ void redwood_gpu_worked(uint64_t * microseconds, uint32_t * submissions, uint32_t by[7]);
++void redwood_gpu_ts(uint64_t * busy_ticks, uint64_t * exec_ticks, uint64_t * span_ticks, uint32_t * n);   /* 0165 */
++uint64_t redwood_gpu_now_ticks(void);           /* 0165 */
+ void redwood_gpu_report(const char * why);
+ void redwood_gpu_stop(void);
+ uint32_t redwood_gpu_done_fence(void);          /* 0161: SweetAdreno.cpp */
+@@ -201,6 +203,10 @@ struct redwood_show {
+  */
+ #define GPU_SLACK               0x10000ull
+ static TUNABLE(uint32_t, gGPUSlack, "gpu_slack", 0);
++/* 0165: boot-arg gpu_ts=1 (also read by SweetAdreno.cpp): GPU timestamps of each submission, logged with the statistics */
++static TUNABLE(uint32_t, gGPUTs, "gpu_ts", 0);
++static bool gGPUTsTold;
++static uint64_t gGPUTsTicks, gGPUTsAt;          /* counter and mach time at the previous timestamps line */
+ 
+ static uint64_t gpu_slack_page(void);
+ 
+@@ -1873,6 +1879,12 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
+ 		gGPUReported = true;
+ 		redwood_gpu_report("the ring is full");
+ 	}
++	if (gGPUTs && !gGPUTsTold && request->fence != 0) {
++		gGPUTsTold = true;
++		gGPUTsTicks = redwood_gpu_now_ticks();
++		gGPUTsAt = mach_absolute_time();
++		IOLog("RedwoodGPU: GPU timestamps on (0165)\n");
++	}
+ 	if (fSubmits++ < 4) {
+ 		IOLog("RedwoodGPU: submission %u: %u command buffers, the first at %#llx, %u words\n", request->fence, count,
+ 		    addresses[0], words[0]);
+@@ -1905,6 +1917,20 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
+ 		IOLog("RedwoodGPU: the GPU worked %llu us on each of %u (%u under 0.1 ms, %u under 0.25, %u under 0.5, "
+ 		    "%u under 1, %u under 2, %u under 4, %u longer; %llu ms in all)\n",
+ 		    worked, timed, by[0], by[1], by[2], by[3], by[4], by[5], by[6], worked * timed / 1000);
++		if (gGPUTs && gGPUTsTold) {
++			/* 0165: ticks of the 19.2 MHz always-on counter; the last pair measures that rate */
++			uint64_t busy, exec, span, ticks = redwood_gpu_now_ticks(), at = mach_absolute_time(), at_ns;
++			uint32_t n;
++
++			redwood_gpu_ts(&busy, &exec, &span, &n);
++			absolutetime_to_nanoseconds(at - gGPUTsAt, &at_ns);
++			IOLog("RedwoodGPU: GPU timestamps (0165): busy %llu us of %llu us (%u %%), exec %llu us mean over %u "
++			    "submissions, counter %llu ticks in %llu us\n",
++			    busy * 10 / 192, span * 10 / 192, span ? (uint32_t)(busy * 100 / span) : 0,
++			    n ? exec * 10 / 192 / n : 0, n, ticks - gGPUTsTicks, at_ns / NSEC_PER_USEC);
++			gGPUTsTicks = ticks;
++			gGPUTsAt = at;
++		}
+ 		IOLog("RedwoodGPU: %u waits of %llu us, %u over before they began; %u IOSurfaces taken as buffers in "
+ 		    "%llu us each; %u buffers, %llu MB\n",
+ 		    gGPUStat.waits, gGPUStat.waits ? waiting / NSEC_PER_USEC / gGPUStat.waits : 0, gGPUStat.over,
+diff --git a/iokit/Kernel/arm/SweetAdreno.cpp b/iokit/Kernel/arm/SweetAdreno.cpp
+index 2c144c9..dbe68f6 100644
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -26,6 +26,7 @@
+ #include <IOKit/IOLocks.h>
+ #include <IOKit/IOBufferMemoryDescriptor.h>
+ #include <pexpert/pexpert.h>
++#include <kern/startup.h>
+ #include <kern/thread.h>
+ #include <mach/mach_time.h>
+ #include <vm/pmap.h>
+@@ -54,6 +55,8 @@ bool redwood_gpu_done(uint32_t fence);
+ uint32_t redwood_gpu_last(void);
+ uint32_t redwood_gpu_pending_ms(void);         /* 0097: ms the last submission has waited, 0 if done */
+ void redwood_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7]);
++void redwood_gpu_ts(uint64_t *busy_ticks, uint64_t *exec_ticks, uint64_t *span_ticks, uint32_t *n);     /* 0165 */
++uint64_t redwood_gpu_now_ticks(void);           /* 0165: CP always-on counter, read by the CPU */
+ void redwood_gpu_report(const char *why);
+ void redwood_gpu_stop(void);
+ uint32_t redwood_gpu_done_fence(void);          /* 0161 */
+@@ -96,6 +99,11 @@ uint32_t gpu_log;
+ #define CP_INDIRECT_BUFFER  0x3f
+ #define CP_EVENT_WRITE      0x46
+ #define CACHE_FLUSH_TS      4
++/* 0165 (mesa 25.0.7 adreno_pm4.xml / a6xx.xml; Linux a6xx get_stats_counter, mesa fd6_record_ts) */
++#define CP_REG_TO_MEM       0x3e
++#define CP_ALWAYS_ON_COUNTER 0x980
++#define RB_DONE_TS          22
++#define TS_OFF              0x100           /* 0165: timestamp slots in the fence page */
+ 
+ #define PTE_PAGE        (3ull | (1ull << 10) | (3ull << 8) | (1ull << 6))    /* page, AF, inner shareable, AP=01, attr 0 (NC) */
+ #define PTE_RO          (1ull << 7)
+@@ -111,6 +119,8 @@ static IOLock *hw_lock;
+ static uint32_t table_next;             /* next free 4 KiB table in the pool's table area */
+ static bool tables_dirty;
+ static uint64_t submit_count;
++/* 0165: boot-arg gpu_ts=1: each submission writes the always-on counter before its IBs and at end of pipe */
++static TUNABLE(uint32_t, gGPUTs, "gpu_ts", 0);
+ 
+ static inline uint32_t rd(uint32_t o) { return *(volatile uint32_t *)(gpu + o); }
+ static inline void wr(uint32_t o, uint32_t v) { __asm__ volatile ("dmb oshst" ::: "memory"); *(volatile uint32_t *)(gpu + o) = v; }
+@@ -153,6 +163,20 @@ fence_word(void)
+ 	return (volatile uint32_t *)(shared + SHARED_FENCE);
+ }
+ 
++/* 0165: a submission's timestamp slot (start u64, end u64) in the fence page; words 0-1 start, 2-3 end */
++#define TIMED           64
++static inline volatile uint32_t *
++ts_slot(uint32_t fence)
++{
++	return (volatile uint32_t *)(shared + SHARED_FENCE + TS_OFF + 16 * (fence % TIMED));
++}
++
++static inline uint64_t
++ts_gva(uint32_t fence)
++{
++	return GVA_FENCE + TS_OFF + 16 * (fence % TIMED);
++}
++
+ /* ---- page tables (CB1, 4 KiB granule, walks start at level 1) ---- */
+ 
+ static uint32_t
+@@ -524,19 +548,45 @@ redwood_gpu_to_memory(void *start, uint64_t size)
+  * (looks are 200 us apart while somebody waits), for RedwoodGPU's statistics; and the
+  * GPU's state, logged, when one is not done after 100 ms.
+  */
+-#define TIMED           64
+ static uint64_t submitted_at[TIMED];
+ static uint32_t done_seen, slow_told, slow_logged;
+ static uint64_t worked_us, worked_n;
+ static uint32_t worked_by[7];
++/* 0165: GPU timestamps (always-on counter ticks) of the submissions done since redwood_gpu_ts() */
++static uint64_t ts_exec, ts_busy, ts_first, ts_last, ts_prev_end;
++static uint32_t ts_n;
++
++static void
++note_ts(uint32_t f)
++{
++	volatile uint32_t *slot = ts_slot(f);
++	uint64_t start = (uint64_t)slot[0] | ((uint64_t)slot[1] << 32);
++	uint64_t end = (uint64_t)slot[2] | ((uint64_t)slot[3] << 32);
++	if (start == 0 || end == 0 || end < start) {
++		return;
++	}
++	ts_exec += end - start;
++	uint64_t from = start > ts_prev_end ? start : ts_prev_end;
++	ts_busy += end > from ? end - from : 0;
++	if (ts_n++ == 0) {
++		ts_first = start;
++	}
++	ts_last = end;
++	ts_prev_end = end;
++}
+ 
+ static void
+ note_done(uint32_t now_done)
+ {
+ 	uint64_t now = mach_absolute_time();
++	/* 0165: past TIMED - 8 at once, the slots may hold newer submissions' timestamps */
++	bool ts = gGPUTs != 0 && (uint32_t)(now_done - done_seen) <= TIMED - 8;
+ 	while ((int32_t)(now_done - done_seen) > 0) {
+ 		uint32_t f = ++done_seen;
+ 		uint64_t ns, us;
++		if (ts) {
++			note_ts(f);
++		}
+ 		absolutetime_to_nanoseconds(now - submitted_at[f % TIMED], &ns);
+ 		us = ns / 1000;
+ 		worked_us += us;
+@@ -604,11 +654,42 @@ redwood_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7]
+ 	bzero(worked_by, sizeof(worked_by));
+ }
+ 
+-/* IBs, then CACHE_FLUSH_TS writing the submission's number into the fence page. 0: ring full. */
++/* 0165: the window since the last call, in counter ticks; span is first start to last end */
++void
++redwood_gpu_ts(uint64_t *busy_ticks, uint64_t *exec_ticks, uint64_t *span_ticks, uint32_t *n)
++{
++	*busy_ticks = ts_busy;
++	*exec_ticks = ts_exec;
++	*span_ticks = ts_n ? ts_last - ts_first : 0;
++	*n = ts_n;
++	ts_busy = ts_exec = ts_first = ts_last = 0;
++	ts_n = 0;                               /* (ts_prev_end is kept) */
++}
++
++/* 0165: CP_ALWAYS_ON_COUNTER (0x980 lo, 0x981 hi) from the CPU, hi-lo-hi */
++uint64_t
++redwood_gpu_now_ticks(void)
++{
++	if (!ready) {
++		return 0;
++	}
++	uint32_t hi, lo;
++	do {
++		hi = gpu_rd(0x981);
++		lo = gpu_rd(0x980);
++	} while (gpu_rd(0x981) != hi);
++	return ((uint64_t)hi << 32) | lo;
++}
++
++/*
++ * IBs, then CACHE_FLUSH_TS writing the submission's number into the fence page. 0: ring full.
++ * 0165, gpu_ts=1: CP_REG_TO_MEM of the always-on counter before the IBs and CP_EVENT_WRITE
++ * RB_DONE_TS (the counter at end of pipe) after them, into the submission's slot.
++ */
+ uint32_t
+ redwood_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count)
+ {
+-	uint32_t need = 4 * count + 5;
++	uint32_t need = 4 * count + 5 + (gGPUTs ? 4 + 5 : 0);
+ 
+ 	if (!ready) {
+ 		return 0;
+@@ -621,16 +702,33 @@ redwood_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t co
+ 		IOLockUnlock(hw_lock);
+ 		return 0;
+ 	}
++	if (++seqno == 0) {
++		seqno = 1;
++	}
++	uint32_t fence = seqno;
++	if (gGPUTs) {
++		volatile uint32_t *slot = ts_slot(fence);
++		uint64_t ts = ts_gva(fence);
++		slot[0] = slot[1] = slot[2] = slot[3] = 0;      /* a stale value reads as not written */
++		emit(pkt7(CP_REG_TO_MEM, 3));
++		emit(CP_ALWAYS_ON_COUNTER | (2u << 18) | (1u << 30));      /* CNT 2, 64B */
++		emit((uint32_t)ts);
++		emit((uint32_t)(ts >> 32));
++	}
+ 	for (uint32_t i = 0; i < count; i++) {
+ 		emit(pkt7(CP_INDIRECT_BUFFER, 3));
+ 		emit((uint32_t)addresses[i]);
+ 		emit((uint32_t)(addresses[i] >> 32));
+ 		emit(words[i]);
+ 	}
+-	if (++seqno == 0) {
+-		seqno = 1;
++	if (gGPUTs) {
++		uint64_t ts = ts_gva(fence) + 8;
++		emit(pkt7(CP_EVENT_WRITE, 4));
++		emit(RB_DONE_TS | (1u << 30));                  /* TIMESTAMP */
++		emit((uint32_t)ts);
++		emit((uint32_t)(ts >> 32));
++		emit(0);
+ 	}
+-	uint32_t fence = seqno;
+ 	submitted_at[fence % TIMED] = mach_absolute_time();
+ 	emit(pkt7(CP_EVENT_WRITE, 4));
+ 	emit(CACHE_FLUSH_TS);
+@@ -795,6 +893,9 @@ sweet_adreno_start(void)
+ 	va_free_count = 0;
+ 	redwood_gpu_address_free(VA_USER_START, VA_USER_END - VA_USER_START);
+ 	*fence_word() = 0;
++	for (uint32_t i = 0; i < 4 * TIMED; i++) {         /* 0165: the timestamp slots */
++		((volatile uint32_t *)(shared + SHARED_FENCE + TS_OFF))[i] = 0;
++	}
+ 	seqno = 0;
+ 	wptr = gpu_rd(0x807) % RB_DWORDS;
+ 	ready = true;
