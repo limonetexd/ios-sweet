@@ -551,3 +551,11 @@ Two things the same log says about the rest of the headroom:
 | 2026-11-19 | `shim-boot-0170g.img` (`00a66754...`), kernel 0164, native, 60 Hz, 0165b flags + `sweetmetal_fddebug=gmem` | `SWEET_SERIAL=f492cad9 tools/sweet-boot-test.sh ... 0170g 420` (back in fastboot after 335 s) | every batch tiled; less GPU time than 0165b | 0 SMMU/FAR/`THE GPU DID NOT` lines; `batches 13.2/cb = sysmem 0 + gmem 13.2` (0165b 6.4), `bins 9024 (mean 17.8 per gmem batch)`, cpu/cb **12.73 ms** (7.37), subs 18780 (12071), submission latency **23.10 ms** (18.87), waits mean 15566 us, **19.7 swaps/s** (21.4), best second 42 | `logs/xnu-0170g.txt` |
 
 Verdict (one boot, `experimental`): forcing GMEM is worse on every number. The autotuner's bypass is right for the small batches; forcing them doubles the batches per command buffer and the CPU per command buffer. Closed: keep the autotuner. Picture not confirmed by the user on this boot. Next measurement is true GPU execution time (xnu 0165 `gpu_ts=1`, `SPEC-0165-gpu-timestamps.md`), because "the GPU worked" is a queueing latency, not GPU busy time.
+
+## Async completion (metal 0017, `sweetmetal_async=1`), 0171a against 0165b, 2026-11-20 (userdata flashed with `work1.raw` + 0017 binaries, RAM boot, kernel 0164)
+
+| Date | Build | Procedure | Expected | Actual | Artifacts |
+| --- | --- | --- | --- | --- | --- |
+| 2026-11-20 | root `work1.raw` + metal 0017 (`RedwoodMetal` `682cae23...`, `libredwoodair.dylib` `818354261...`; rollback `root/rollback-0016`), `shim-boot-0171a.img` (`e29289a7...`), 0165b flags + `sweetmetal_async=1` | `tools/metal-flash-test.sh work1.raw shim-boot-0171a.img 0171a 420` | -commit no longer waits; frame = max(CPU, GPU) | 0 SMMU/FAR/`THE GPU DID NOT`; completion thread on in backboardd, SpringBoard, metaltest; client `waits 40` (0165b 3762); **27.4 swaps/s** (0165b 21.4, +28 %), best second **51** (30), hist 40s:27 50s:7; cpu/cb 8.38 ms; submission latency 33.3 ms (18.9: more work queued); async line: 25-38 ms commit to completion, 0-12 bound waits / 5 s; zombies/wired same as 0165b | `logs/xnu-0171a.txt` |
+
+Verdict (one boot, `experimental`, picture not confirmed by the user): the serial wait was our handler delivery, and removing it is the largest single gain since GMEM. The GPU queue is now always full, so the GPU is the wall; next is the true GPU busy time (xnu 0165 `gpu_ts=1`).
