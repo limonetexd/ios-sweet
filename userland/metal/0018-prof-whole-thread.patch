@@ -1,0 +1,35 @@
+--- a/userland/src/redwoodmetal.m
++++ b/userland/src/redwoodmetal.m
+@@ -2123,6 +2123,7 @@
+  * tables are the sampler thread's alone and are never reset.
+  */
+ #define RW_PROF_KEY "sweetmetal_prof="
++static bool rw_prof_whole;   /* 0018: sweetmetal_prof=2 */
+ #define RW_PROF_DEPTH 24
+ #define RW_PROF_LEAF_SLOTS 2048
+ #define RW_PROF_OURS_SLOTS 2048
+@@ -2153,7 +2154,14 @@
+ 				}
+ 			}
+ 		}
+-		on = at != NULL && at[strlen(RW_PROF_KEY)] == '1';
++		on = at != NULL && (at[strlen(RW_PROF_KEY)] == '1' || at[strlen(RW_PROF_KEY)] == '2');
++		/* 0018: sweetmetal_prof=2 keeps the first replaying thread the target for good, so
++		 * the whole frame of that thread is sampled (encoding, waits, swaps), not only -commit */
++		rw_prof_whole = on && at[strlen(RW_PROF_KEY)] == '2';
++		if (rw_prof_whole) {
++			rw_print("prof: sweetmetal_prof=2: the first thread to commit is sampled for its "
++				 "whole life, inside and outside -commit\n");
++		}
+ 	});
+ 	return on;
+ }
+@@ -5678,7 +5686,7 @@
+ 	if (passlog) {
+ 		plemit = rw_passlog_cb_end(&plcb, device, &plblock);
+ 	}
+-	if (profiled) {
++	if (profiled && !rw_prof_whole) {   /* 0018: =2 stays registered */
+ 		rw_prof_unregister();
+ 	}
+ 	rw_lib_unlock();
