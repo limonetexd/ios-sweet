@@ -5,6 +5,8 @@
 > - Read first: `UPSTREAM_SURVEY-2026-11-19.md`, the last three sections of `TEST_LOG.md`.
 > - Traps: image builds need `PATH=$HOME/Developer/ios-sweet-work/bin:$PATH` and `bash tools/...`; check sha256 and `rg -a -o NAME=` in the image. `SWEET_SERIAL=f492cad9` for boot tests.
 
+> - 2026-11-20 13:00: phone LOST from USB (not in fastboot, not adb) after the 0172p userdata flash was interrupted twice (session ended mid-flash at ~01:00). userdata may be half-written: re-run `tools/metal-flash-test.sh work1.raw shim/out/shim-boot-0172p.img 0172p 420` once the phone is in fastboot (Power+Vol-down; charge it first). 0172p = 0171t + metal 0018 `sweetmetal_prof=2` (whole-thread profile of CA's render thread), not booted yet.
+
 # Next phase (lead: Fable or Opus): GPU work per frame at native, and the idle 40 %
 
 0. Ask the user to look at one 0171a-style boot and confirm the picture (no tearing, no stale frames, apps open/close). Until then 0017 stays default off.
