@@ -575,3 +575,12 @@ Verdict (one boot, `experimental`): the GPU executes ~21 ms per native frame (58
 | 2026-11-21 | root `work1.raw` + metal 0017+0018, `shim-boot-0172p.img` (`f4577835...`), 0171t flags + `sweetmetal_prof=2` | detached `tools/metal-flash-test.sh ... 0172p 420` (log `logs/flash-0172p.log`) | where backboardd's render thread spends a 36 ms frame | 0 fault lines; 26.1 swaps/s under 1 kHz sampling; backboardd's first committing thread: 157690 samples, **running 32 %, waiting 68 %**, leaf `mach_msg2_trap` 125716 (80 %); ~14.6 ms of thread CPU a frame (encode + 9.5 ms commit); top own code `rwa_render_draw`, `rwa_flush`, `rwa_texture_from_surface` | `logs/xnu-0172p.txt` |
 
 Verdict: the render server waits to be given work most of the frame; neither its CPU nor the GPU (40-60 % busy) paces the frame. Only VSYNC notifications are sent by `SweetFramebuffer` (no swap-complete gate). Next: sample the main threads (metal 0019 `sweetmetal_prof=3`): SpringBoard's main thread is the suspected pacer during swipes (also HakiOS's and DC28088's remaining limit).
+
+## Main threads (metal 0019 `sweetmetal_prof=3`, 0172m) and DontCare discard (metal 0020, 0173d), 2026-11-21 (userdata flashed each time, RAM boots, kernel 0165)
+
+| Date | Build | Procedure | Expected | Actual | Artifacts |
+| --- | --- | --- | --- | --- | --- |
+| 2026-11-21 | metal 0017-0019, `shim-boot-0172m.img`, 0171t flags + `sweetmetal_prof=3` | detached `tools/metal-flash-test.sh ... 0172m 420` | which main thread paces a frame | 0 fault lines; 27.1 swaps/s; SpringBoard main thread running **16 %** (31165 of 190619 samples, leaf `mach_msg2_trap` 157383); backboardd main thread 0.2 % | `logs/xnu-0172m.txt` |
+| 2026-11-21 | metal 0017-0020 (`libredwoodair` `ca1963c9...`), `shim-boot-0173d.img` (`a1e9e247...`), exactly 0171t's flags | detached `tools/metal-flash-test.sh ... 0173d 420` | DontCare attachments not restored into GMEM: less GPU time | 0 fault lines; async line: **339-451 attachments discarded / 5 s, 0 kept**; **27.5 swaps/s** (0171t 27.7), GPU busy 44.2 %, exec 7.10 ms a submission (7.17) | `logs/xnu-0173d.txt` |
+
+Verdict (one boot each, `experimental`): no thread is saturated -- CA's render thread 32 %, SpringBoard's main thread 16 %, GPU 44 % -- yet frames are ~36 ms apart, so the frame is a latency chain (wake-ups, core placement, timers), not a throughput limit. 0020 is correct and neutral here (most of our batches are sysmem); kept. Next: xnu 0166 (AMP + no timer coalescing).
