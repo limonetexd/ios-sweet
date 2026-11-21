@@ -1,0 +1,231 @@
+From: HakiOS
+Subject: [PATCH 0167] sweet: bilinear scaled panel copy (sweetfb_filter=1) and copy time stat
+
+The scaled copy of a 750x1624 frame (crop 720x1600) to the 1080x2400 panel is nearest
+neighbour: at 1.5x every second source row and column is shown twice, which the user sees as
+pixelated. Boot-arg sweetfb_filter=1 makes the scaled copy bilinear: pixel-centre mapping,
+2x2 source pixels blended per channel in integer SWAR (no FP, no NEON), each panel pixel
+written once and in order, the panel never read; the last source row and column are never
+passed (weight 0 there). The band's cache invalidate covers the bottom source row too.
+sweetfb_filter=0 (default) keeps the nearest path as it was; the 1:1 path is untouched.
+Logged at start: "SWEET FB: scaled copy filter nearest|bilinear".
+
+Also: time in copy() for both paths, once a second when there were copies:
+"SWEET FB copy: N copies, avg X us, max Y us".
+
+Not compiled locally; CI is the compiler.
+---
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 393d3db..d1c5e5b 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -233,6 +233,10 @@ public:
+ 	uint32_t      fBeamLines;             /* lines a scan, blanking included */
+ 	uint64_t      fBeamPeriod;            /* mach ticks a scan */
+ 	uint32_t      fStatBeamFrames, fStatBeamTorn;  /* 0146: frames written behind the scan, and torn ones */
++	/* 0167: boot-arg sweetfb_filter (0 nearest, 1 bilinear) for the scaled copy; time spent in copy() */
++	uint32_t      fFilter;
++	uint64_t      fStatCopySum, fStatCopyMax;     /* mach ticks this window */
++	uint32_t      fStatCopies;
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+@@ -573,6 +577,10 @@ AppleCLCD::start(IOService *provider)
+ 	}
+ 	IOLog("SWEET FB: device tree canvas %ux%u: %ux%u frames%s\n", canvasW, canvasH, fLogicalW, fLogicalH,
+ 	    fScale ? ", cropped 720x1600 and scaled to the panel" : "");
++	/* 0167: boot-arg sweetfb_filter=1: the scaled copy blends 2x2 source pixels (bilinear); 0 (default) nearest */
++	fFilter = 0;
++	PE_parse_boot_argn("sweetfb_filter", &fFilter, sizeof(fFilter));
++	IOLog("SWEET FB: scaled copy filter %s\n", fFilter == 1 ? "bilinear" : "nearest");
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+@@ -632,6 +640,8 @@ AppleCLCD::start(IOService *provider)
+ 
+ 	/* 0097: a thread that says what the display and the GPU did, once a second. */
+ 	fStatWindow = mach_absolute_time();
++	fStatCopySum = fStatCopyMax = 0;        /* 0167 */
++	fStatCopies = 0;
+ 	if ((fStatLock = IOLockAlloc()) != NULL) {
+ 		thread_t thread;
+ 		if (kernel_thread_start(&AppleCLCD::statsMain, this, &thread) == KERN_SUCCESS) {
+@@ -996,6 +1006,8 @@ AppleCLCD::statsReport(void)
+ 		uint64_t now = mach_absolute_time();
+ 		uint64_t window = 0, swapgap, vsyncgap, psum, pmax;
+ 		uint32_t swaps, late, presents, stale, stalls, repeats;
++		uint64_t copySum, copyMax;              /* 0167 */
++		uint32_t copies;
+ 		uint64_t wired = 0;
+ 		uint32_t live = 0, zombies = 0, failed = 0;
+ 
+@@ -1023,6 +1035,11 @@ AppleCLCD::statsReport(void)
+ 		fStatLateSwaps = 0;
+ 		fStatPresents = 0;
+ 		fStatStale = 0;
++		copySum = fStatCopySum;                 /* 0167 */
++		copyMax = fStatCopyMax;
++		copies = fStatCopies;
++		fStatCopySum = fStatCopyMax = 0;
++		fStatCopies = 0;
+ 		IOLockUnlock(fStatLock);
+ 		sweet_surface_stats(&wired, &live, &zombies, &failed);
+ 		uint32_t pending = redwood_gpu_pending_ms();
+@@ -1032,6 +1049,13 @@ AppleCLCD::statsReport(void)
+ 		    swaps, window / 1000000,
+ 		    swapgap / 1000000, late, presents, presents ? psum / 1000 / presents : 0, pmax / 1000, stale,
+ 		    vsyncgap / 1000000, pending, redwood_gpu_last(), live, zombies, wired >> 20, failed, repeats);
++		/* 0167: the panel copies of this window (copy(), all bands, helpers included) */
++		if (copies != 0) {
++			uint64_t avgNs = 0, maxNs = 0;
++			absolutetime_to_nanoseconds(copySum / copies, &avgNs);
++			absolutetime_to_nanoseconds(copyMax, &maxNs);
++			IOLog("SWEET FB copy: %u copies, avg %llu us, max %llu us\n", copies, avgNs / 1000, maxNs / 1000);
++		}
+ 		/*
+ 		 * 0143: SWEET THERM once every 5 s (sweettherm=0 off). The maps are taken here, on the
+ 		 * first tick, and the first read is the fifth, so nothing touches the TSENS blocks
+@@ -1163,6 +1187,8 @@ struct SweetCopyJob {
+ 	bool      scale;                /* 0129: source rect -> destination rect */
+ 	uint32_t  scaleSrcW, scaleSrcH, scaleDstW, scaleDstH;
+ 	uint16_t  scaleX[SWEET_FB_LOGICAL_W];   /* 0131: source column for each destination pixel */
++	bool      bilinear;             /* 0167: blend 2x2 source pixels (scale only) */
++	uint8_t   scaleFX[SWEET_FB_LOGICAL_W];  /* 0167: weight of the right neighbour, 0..255 (bilinear) */
+ 	int32_t   dy;                   /* panel row of the first row */
+ 	bool      invalidate;           /* dc civac each band first */
+ 	uint32_t  next;                 /* next band to take (atomic) */
+@@ -1173,6 +1199,37 @@ struct SweetCopyJob {
+ 	uint32_t  torn;                 /* bands written too late for the next scan (atomic) */
+ };
+ 
++/*
++ * 0167: pixel-centre mapping of destination index d (of dstN) onto the source (of srcN): the first
++ * source index, returned, and the weight of the next one in *frac (0..255). At the last source
++ * index the weight is 0, so nothing past it is needed.
++ */
++static inline uint32_t
++sweet_fb_centre(uint32_t d, uint32_t srcN, uint32_t dstN, uint32_t *frac)
++{
++	uint64_t f = ((2 * (uint64_t)d + 1) * srcN * 256) / (2 * (uint64_t)dstN);
++	f = f >= 128 ? f - 128 : 0;
++	uint32_t i = (uint32_t)(f >> 8);
++	uint32_t w = (uint32_t)(f & 255);
++	if (i >= srcN - 1) {
++		i = srcN - 1;
++		w = 0;
++	}
++	*frac = w;
++	return i;
++}
++
++/* 0167: (a * (256 - w) + b * w) >> 8 per 8-bit channel, w 0..255; w 0 gives a exactly */
++static inline uint32_t
++sweet_fb_lerp(uint32_t a, uint32_t b, uint32_t w)
++{
++	uint32_t iw = 256 - w;
++	/* each 16-bit lane sums to at most 255 * 256: no carry into the next lane */
++	uint32_t rb = (((a & 0x00FF00FF) * iw + (b & 0x00FF00FF) * w) >> 8) & 0x00FF00FF;
++	uint32_t ag = (((a >> 8) & 0x00FF00FF) * iw + ((b >> 8) & 0x00FF00FF) * w) & 0xFF00FF00;
++	return rb | ag;
++}
++
+ static void
+ sweet_fb_copy_band(SweetCopyJob *job, uint32_t band)
+ {
+@@ -1193,7 +1250,15 @@ sweet_fb_copy_band(SweetCopyJob *job, uint32_t band)
+ 		}
+ 	}
+ 	if (job->invalidate) {
+-		if (job->scale) {
++		if (job->scale && job->bilinear) {
++			/* 0167: from the first row's top source row to the last row's bottom one */
++			uint32_t fy;
++			uint32_t sy0 = sweet_fb_centre(y0, job->scaleSrcH, job->scaleDstH, &fy);
++			uint32_t syl = sweet_fb_centre(y1 - 1, job->scaleSrcH, job->scaleDstH, &fy);
++			uint32_t sy1 = (syl + 1 < job->scaleSrcH ? syl + 1 : job->scaleSrcH - 1) + 1;
++			redwood_gpu_to_memory((void *)(job->srcRows + (uint64_t)sy0 * job->srcRowBytes),
++			    (uint64_t)(sy1 - sy0) * job->srcRowBytes);
++		} else if (job->scale) {
+ 			uint32_t sy0 = (uint32_t)((uint64_t)y0 * job->scaleSrcH / job->scaleDstH);
+ 			uint32_t sy1 = (uint32_t)((uint64_t)y1 * job->scaleSrcH / job->scaleDstH) + 1;
+ 			redwood_gpu_to_memory((void *)(job->srcRows + (uint64_t)sy0 * job->srcRowBytes),
+@@ -1202,7 +1267,24 @@ sweet_fb_copy_band(SweetCopyJob *job, uint32_t band)
+ 			redwood_gpu_to_memory((void *)src, (uint64_t)(y1 - y0) * job->srcRowBytes);
+ 		}
+ 	}
+-	if (job->scale) {
++	if (job->scale && job->bilinear) {
++		/* 0167: each panel pixel written once, in order; the panel is never read */
++		for (uint32_t y = y0; y < y1; y++) {
++			uint32_t fy;
++			uint32_t sy = sweet_fb_centre(y, job->scaleSrcH, job->scaleDstH, &fy);
++			uint32_t sy2 = sy + 1 < job->scaleSrcH ? sy + 1 : job->scaleSrcH - 1;
++			const uint32_t *top = (const uint32_t *)(job->srcRows + (uint64_t)sy * job->srcRowBytes + job->srcColumn);
++			const uint32_t *bot = (const uint32_t *)(job->srcRows + (uint64_t)sy2 * job->srcRowBytes + job->srcColumn);
++			uint32_t *drow = (uint32_t *)(dst + (uint64_t)(y - y0) * job->dstRowBytes);
++			for (uint32_t x = 0; x < job->scaleDstW; x++) {
++				uint32_t i = job->scaleX[x], fx = job->scaleFX[x];
++				uint32_t j = i + (fx != 0);     /* fx is 0 at the last column */
++				uint32_t t = sweet_fb_lerp(top[i], top[j], fx);
++				uint32_t b = sweet_fb_lerp(bot[i], bot[j], fx);
++				drow[x] = sweet_fb_lerp(t, b, fy);
++			}
++		}
++	} else if (job->scale) {
+ 		for (uint32_t y = y0; y < y1; y++) {
+ 			uint32_t sy = (uint32_t)((uint64_t)y * job->scaleSrcH / job->scaleDstH);
+ 			uintptr_t srow = job->srcRows + (uint64_t)sy * job->srcRowBytes + job->srcColumn;
+@@ -1711,10 +1793,31 @@ AppleCLCD::present(const uint8_t *rec)
+ 				job.scaleSrcH = (uint32_t)(y1 - y0);
+ 				job.scaleDstW = (uint32_t)pdw;
+ 				job.scaleDstH = (uint32_t)pdh;
+-				for (int32_t x = 0; x < pdw; x++) {
+-					job.scaleX[x] = (uint16_t)(((int64_t)x * job.scaleSrcW) / job.scaleDstW);
++				job.bilinear = fFilter == 1;    /* 0167 */
++				if (job.bilinear) {
++					/* 0167: pixel centres; at the last source column scaleFX is 0 */
++					for (int32_t x = 0; x < pdw; x++) {
++						uint32_t fx;
++						job.scaleX[x] = (uint16_t)sweet_fb_centre((uint32_t)x, job.scaleSrcW, job.scaleDstW, &fx);
++						job.scaleFX[x] = (uint8_t)fx;
++					}
++				} else {
++					for (int32_t x = 0; x < pdw; x++) {
++						job.scaleX[x] = (uint16_t)(((int64_t)x * job.scaleSrcW) / job.scaleDstW);
++					}
+ 				}
++				uint64_t copyBegan = mach_absolute_time();     /* 0167 */
+ 				copy(&job);
++				uint64_t copyTicks = mach_absolute_time() - copyBegan;
++				if (fStatLock != NULL) {
++					IOLockLock(fStatLock);
++					fStatCopySum += copyTicks;
++					fStatCopies++;
++					if (copyTicks > fStatCopyMax) {
++						fStatCopyMax = copyTicks;
++					}
++					IOLockUnlock(fStatLock);
++				}
+ 				if (scan != 0 && fStatLock != NULL) {
+ 					IOLockLock(fStatLock);
+ 					fStatBeamFrames++;
+@@ -1781,7 +1884,19 @@ AppleCLCD::present(const uint8_t *rec)
+ 			job.blank = fBeamLines > fHeight ? fBeamLines - fHeight : 0;
+ 			job.torn = 0;
+ 			job.scale = false;
++			job.bilinear = false;           /* 0167 */
++			uint64_t copyBegan = mach_absolute_time();     /* 0167 */
+ 			copy(&job);
++			uint64_t copyTicks = mach_absolute_time() - copyBegan;
++			if (fStatLock != NULL) {
++				IOLockLock(fStatLock);
++				fStatCopySum += copyTicks;
++				fStatCopies++;
++				if (copyTicks > fStatCopyMax) {
++					fStatCopyMax = copyTicks;
++				}
++				IOLockUnlock(fStatLock);
++			}
+ 			if (scan != 0 && fStatLock != NULL) {
+ 				IOLockLock(fStatLock);
+ 				fStatBeamFrames++;
