@@ -1,20 +1,16 @@
-> State 2026-11-21 (records through the 0174s row of `TEST_LOG.md`; branch `gpu`, pushed).
-> - **Smooth config (user-confirmed, one boot):** 0174s = kernel 0165 (`~/Developer/ios-sweet-work/kernel-0165/xnu-kernel`, SMP) + `SWEET_SCALE=2` (750x1624) + metal 0017 `sweetmetal_async=1` + `gpu_slack=1`: "extremely smooth, with some freezes and hangs", best second 61, GPU 1.8 ms a submission. Faults: pixelated (nearest-neighbour 1.5x CPU upscale), rdar status bar, freezes/hangs.
-> - Native 1125x2436 with the same stack: ~27 swaps/s (0171a/0173d), GPU 7.1 ms a submission x 3.4 a frame.
-> - Pacing model (fits every boot): CoreAnimation starts a frame at a vsync only when the previous one completed; commit-to-completion is 36-40 ms at native, so frames take 2-3 vsyncs. CPU-side changes (async, AMP, coalescing, DontCare) barely move it. The lever is GPU time per frame.
-> - Closed: forced GMEM (0170g worse), xnu 0166 AMP+no coalescing (0174a: no gain, user "worse"; kernel kept in `kernel-0166` but not used), metal 0020 DontCare discard (correct, neutral, kept), CPUMAX (small).
-> - Phone root = `work1.raw` + metal 0017-0020 binaries (diagnostic 0018/0019 `sweetmetal_prof=2/3` are off unless asked). Rollbacks: `~/Developer/ios-sweet-work/root/rollback-0016`.
-> - Tools: `bash tools/...`, `PATH=$HOME/Developer/ios-sweet-work/bin:$PATH`; flashes/boots run detached (`nohup ... & disown`, log in `logs/`) because a dying session killed a flash once; `SWEET_SERIAL=f492cad9`. Userdata flash = `tools/metal-flash-test.sh work1.raw IMAGE TAG 420` (~20 min). CI kernel: `gh workflow run xnu.yml -R limonetexd/ios-sweet-gpu --ref gpu`.
-> - Read first: `SMOOTH_PORTS-2026-11-21.md`, `UPSTREAM_SURVEY-2026-11-19.md`, last five sections of `TEST_LOG.md`.
+> State 2026-11-21 evening (records through the 0176m rows of `TEST_LOG.md`; branch `gpu`, pushed, `7c7cfb0`).
+> - **Kernel now:** CI kernel 0165+0167+0168+0169 (`~/Developer/ios-sweet-work/kernel-0169/xnu-kernel`); 0166 (AMP) parked in `xnu/patches-pending`. Image `shim/out/shim-boot-0175e.img` = 750x1624 (`SWEET_SCALE=2`, `SWEETFB_HZ=60`) + 0174s flags + `sweetfb_filter=1`.
+> - **Upscale (step 1 of the last phase):** 0169 exact-1.5x linear filter (p, avg(p,q), q) copies a frame in **3.4 ms** (nearest 4.5 ms, general bilinear 0167/0168 29 ms = unusable). **The user has not looked at it yet** (0175e and 0176m ran unattended). User on nearest (0175d): "good with a lot of lags, and pixelated".
+> - **Phone root:** `work1.raw` + metal 0017-0021 payload (flashed 0176m). Rollbacks: `~/Developer/ios-sweet-work/root/rollback-0016`.
+> - **metaltest: 19/21.** 12, 13 pass with metal 0021 (blit encoder: `rwa_texture_copy/buffer_copy/texture_gen_mipmap/buffer_fill` in `air_metal.c`, encoder in `redwoodmetal.m`). 18, 19 (CA quad lph/lpf) build now (test configures attribute 4) but draw `000000ff` everywhere.
+> - Tools: `PATH=$HOME/Developer/ios-sweet-work/bin:$PATH` (gcc for the shim: without it `sweet-gpu-image.sh` silently reuses the last image -- check the RAMDISK MATCH line). Metal: `bash tools/metal-build.sh {ios,driver,test,payload}` (donor tree `~/Developer/ios-sweet-work/metal-build/donor`). Flash+boot: `SWEET_SERIAL=f492cad9 nohup tools/metal-flash-test.sh ~/Developer/ios-sweet-work/root/work1.raw IMAGE TAG 720 & disown` (~30 min). User allowed userdata flashing this session; re-ask next session.
+> - Host AIR tools: `~/Developer/ios-sweet-work/metal-build/host/build/src/compiler/air/air2nir [--ll|--interface] QuartzCore.metallib FUNC` (QuartzCore metallib in `~/Developer/ios-sweet-work/metal/corpus/System/Library/Frameworks/QuartzCore.framework/`).
 
-# Next phase (lead: Opus/Fable): keep 750x1624's smoothness, at a better picture
+# Next phase: metaltest 21/21 (user asked: "make it pass all of the metal tests", REA available)
 
-User question: "is it possible to achieve this smoothness on higher resolution?" Answer so far: yes in steps. Do them in this order, one change per boot, user looks at each:
+1. **Show the user 0175e first** (one RAM boot, user at the phone): sharper than 0175d? same lag? Record it. If the filter is fine, that closes the upscale step.
+2. **Tests 18/19:** `fixed_frag_lph_cph` is CA's uber-shader driven by function constants (`fc_color_inputs0`, `fc_color_opcodes0` (uchar3), `fc_plane_count0`, `fc_texcoord_count0`, `fc_color_opaque0`, `fc_dest_count`, `fc_vertex_layout`, ...); undefined -> 0. It returns three `half4` (check which are render targets). Find the constants CoreAnimation uses for a plain vertex-coloured quad: REA, static, on QuartzCore (`CA::OGL::MetalContext::create_pipeline_state` 0x188380b94 per `METAL_FINDINGS.md`, the `FragmentShaderConfig` it fills). Read `REA_SAFE_PROTOCOL.md` first. Then set those constants in `caQuad()` via `MTLFunctionConstantValues` (check `redwoodmetal.m` really applies them: `fc=empty` is printed today). Also decide whether "black" is the right answer for undefined constants; a test whose expectation is wrong gets fixed, not the driver.
+3. Test 17 passes but `GPUStartTime/EndTime` are 0: optional, the kernel's 0165 timestamps could feed them.
+4. Then the old list: rdar status bar at 750x1624, 828x1792, native GPU work per frame, freezes/hangs (see git history of this file, `036040a`).
 
-1. **Better upscale at 750x1624** (fixes "pixelated" now): bilinear instead of nearest in the kernel's panel copy (HakiOS: nearest while moving, bilinear when still; their `fb_filter=1` cost late shares), or an A6xx 2D-engine scaled blit (mesa `fd6_blitter.cc`, DC28088's plan) that also frees the CPU copy. Find the copy in `SweetFramebuffer.cpp` (`present()`, copy helper threads).
-2. **rdar status bar at 750x1624:** HakiOS `inject_sb.c` makes SpringBoard's fallback status bar the iPhone X's; DC28088 found a MobileGestalt cache must match the canvas.
-3. **Intermediate size 828x1792 @2x** (iPhone XR class, `fbsubtype=1792`; HakiOS 118 fps scroll, no rdar bar): 1.53x the pixels of 750x1624, still 1.85x fewer than native.
-4. **Native:** cut GPU work per frame below ~12 ms: per-pass GPU timing (extend xnu 0165 timestamps per submission with the pass's size/draws), then the heavy passes (blur, wallpaper: HakiOS `wallpaper_freeze`).
-5. **Freezes/hangs** at 750x1624: catch one in a log (SWEET FPS `longest`, `not done after`, SpringBoard main thread with `sweetmetal_prof=3`).
-
-Rules: RAM boots only unless userdata must change; state the rung; record a `TEST_LOG.md` row per boot; stop at the phase end and rewrite this file.
+Rules: one change per build/boot; state the rung; a `TEST_LOG.md` row per boot; stop at the phase end and rewrite this file.
