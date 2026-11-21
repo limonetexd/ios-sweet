@@ -1,0 +1,56 @@
+--- a/userland/src/redwoodmetal.m
++++ b/userland/src/redwoodmetal.m
+@@ -2124,6 +2124,7 @@
+  */
+ #define RW_PROF_KEY "sweetmetal_prof="
+ static bool rw_prof_whole;   /* 0018: sweetmetal_prof=2 */
++static bool rw_prof_main_thread;   /* 0019: sweetmetal_prof=3 */
+ #define RW_PROF_DEPTH 24
+ #define RW_PROF_LEAF_SLOTS 2048
+ #define RW_PROF_OURS_SLOTS 2048
+@@ -2154,10 +2155,13 @@
+ 				}
+ 			}
+ 		}
+-		on = at != NULL && (at[strlen(RW_PROF_KEY)] == '1' || at[strlen(RW_PROF_KEY)] == '2');
++		on = at != NULL && at[strlen(RW_PROF_KEY)] >= '1' && at[strlen(RW_PROF_KEY)] <= '3';
++		/* 0019: sweetmetal_prof=3 samples the process's main thread for good (the client's
++		 * main thread is what paces a swipe), registered from the first commit */
++		rw_prof_main_thread = on && at[strlen(RW_PROF_KEY)] == '3';
+ 		/* 0018: sweetmetal_prof=2 keeps the first replaying thread the target for good, so
+ 		 * the whole frame of that thread is sampled (encoding, waits, swaps), not only -commit */
+-		rw_prof_whole = on && at[strlen(RW_PROF_KEY)] == '2';
++		rw_prof_whole = on && (at[strlen(RW_PROF_KEY)] == '2' || rw_prof_main_thread);
+ 		if (rw_prof_whole) {
+ 			rw_print("prof: sweetmetal_prof=2: the first thread to commit is sampled for its "
+ 				 "whole life, inside and outside -commit\n");
+@@ -2536,6 +2540,29 @@
+ {
+ 	pthread_t self = pthread_self();
+ 	mach_port_t port = mach_thread_self();   /* +1 send right: `target` owns it if taken */
++	if (rw_prof_main_thread) {
++		/* 0019: the main thread instead: task_threads lists threads in creation order, so the
++		 * first is the main one; its rights are taken +1 each and all but that one let go */
++		thread_act_array_t list = NULL;
++		mach_msg_type_number_t n = 0;
++		pthread_t main_pt = NULL;
++
++		if (task_threads(mach_task_self(), &list, &n) == KERN_SUCCESS && n > 0) {
++			main_pt = pthread_from_mach_thread_np(list[0]);
++			if (main_pt != NULL) {
++				mach_port_deallocate(mach_task_self(), port);
++				port = list[0];
++				self = main_pt;
++				list[0] = MACH_PORT_NULL;
++			}
++			for (mach_msg_type_number_t i = 0; i < n; i++) {
++				if (list[i] != MACH_PORT_NULL) {
++					mach_port_deallocate(mach_task_self(), list[i]);
++				}
++			}
++			vm_deallocate(mach_task_self(), (vm_address_t)list, n * sizeof(list[0]));
++		}
++	}
+ 	uintptr_t hi = (uintptr_t)pthread_get_stackaddr_np(self);
+ 	uintptr_t lo = hi - (uintptr_t)pthread_get_stacksize_np(self);
+ 	bool start = false, registered = false;
