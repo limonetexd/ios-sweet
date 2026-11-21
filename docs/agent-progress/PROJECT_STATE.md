@@ -13,12 +13,12 @@ Nothing is `verified-working`. Full table: `FEATURE_MATRIX.md`.
 - `partially-working` (real device, one boot, 0160vA): Metal UI renders recognisably (Settings, home, App Library, Control Centre). Faults: respring on app exit, blur dotted pattern, missing glyphs, low frame rate. Self-test 15 of 19 (0160vA).
 - `experimental`: Wi-Fi (rungs 1–2 passed; rung 3 result unrecorded), battery.
 - `not-working`: sustained 60 fps (best no-idle run 36 swaps/s; swipe runs are bursts with no per-frame data), 120 Hz, automated screenshots, blur-dismiss stability.
-- Host: `check-patch.py` 144/144; `validate-repo.py` fails on known numbering.
+- Host: `check-patch.py` 151/151 (2026-11-21); `validate-repo.py` fails on known numbering.
 
 ## Environment gaps
 
 - `logs/` recovered 2026-11-08 (gitignored); `reports/` absent. Metal work tree, IPSW and shaders are outside the repository.
-- Present: `aarch64-linux-gnu-gcc`, `mkbootimg` (in `~/Developer/ios-sweet-work/bin`, put it on `PATH`), `ipsw` (`/usr/local/bin`). Missing: `qemu-system-aarch64`, `img2simg`, `~/cxnu`.
+- Present: `aarch64-linux-gnu-gcc`, `mkbootimg` (in `~/Developer/ios-sweet-work/bin`, put it on `PATH`), `ipsw` (`/usr/local/bin`). Missing: `qemu-system-aarch64`, `img2simg`. Kernel patch tree: `~/Developer/ios-sweet-work/cxnu` (not `~/cxnu`; `tools/xnu-tree.sh` defaults to `~/cxnu`, see the warning below).
 
 ## Top three next tasks
 
@@ -33,11 +33,5 @@ Video (decoder, YUV compositing) needs its own audit and is `not-tested`.
 
 ## Handoff
 
-- **Changed:** created `FEATURE_MATRIX`, `GPU_DECISION`, `RESEARCH_LEDGER`, `DECISIONS`, `TEST_LOG`, `PROJECT_STATE`, `NEXT_PROMPT` in this directory. No code, no git writes.
-- **Phase 1/1b:** `tools/sweet-fps-summary.py` parses 0139 lines, selftest passes, byte-identical on real pre-0139 logs. `analysis/gpu_windows.py` added. Results in `TEST_LOG.md`.
-- **Finding:** the 0139 "worked" figure is latency, not GPU busy. Ring occupied 6–21 ms per swap at native; GPU unfinished on 19–48 % of native ticks with a new frame. Two Phase 0 readings corrected in `GPU_DECISION.md`.
-- **Verified (host/CI/read-only device):** git state, upstream divergence, CI status, patch format check, phone is `sweet` / `SM7 UFS` / secure.
-- **Verified by reading source:** the GPU path is GLES over Mesa freedreno, the msm-shaped kernel interface, CPU-copy present.
-- **Not verified:** GPU execution per frame; running GPU clock (level 6, 650 MHz requested and acknowledged at boot); per-frame intervals; bandwidth; time before the first draw; Wi-Fi rung 3.
-- **Risk:** donor license unresolved (`ios-topaz` none detected, `hackios` NOASSERTION). 0143r, the only no-idle run, has 539 VA errors. `tools/xnu-tree.sh:44-45` runs `git reset --hard` and `clean -fdx` in its `XNU_TREE` target (default `~/cxnu`), so never point it at this repository.
-- **Next:** user starts M1. Prompt: `NEXT_PROMPT.md`.
+- Current phase and next step: `NEXT_PROMPT.md` (2026-11-21: keep 750x1624's smoothness at a better picture).
+- **Risk (still true):** donor license unresolved (`ios-topaz` none detected, `hackios` NOASSERTION; `hakios-metal/` is MIT). `tools/xnu-tree.sh:44-45` runs `git reset --hard` and `clean -fdx` in its `XNU_TREE` target (default `~/cxnu`), so never point it at this repository.

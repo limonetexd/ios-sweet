@@ -10,9 +10,9 @@ Fidelity is the real device unless stated. Commit = the kernel/image the observa
 | --- | --- | --- | --- |
 | Boot path: ABL → `fastboot boot` shim → XNU → SpringBoard | partially-working | NOTES:34-40 (image 0156r, ring `logs/xnu-0156r-rung1.txt`, not local) | kernel `eaf1a58` |
 | Kernel CI build | partially-working | `gh run list` this session: run 42407117041 success; run 42508457273 for HEAD still in progress. Host/CI fidelity | `e5a0e26` |
-| Patch format guard | partially-working | this session: `tools/check-patch.py` exit 0 on 144/144 `.patch` files. Host | `c5d9aca` |
+| Patch format guard | partially-working | this session: `tools/check-patch.py` exit 0 on 151/151 `.patch` files (2026-11-21). Host | `fe9ca63` |
 | Repo integrity script | not-working | this session: `tools/validate-repo.py` reports FAILED (numbering gaps, `0097c` name, `0147` header); python/shell syntax checks pass. Host | `c5d9aca` |
-| Local builds on this Mac | blocked | `aarch64-linux-gnu-gcc`, `mkbootimg`, `qemu-system-aarch64`, `img2simg`, `ipsw` missing; `tools/xnu-tree.sh` is WSL-only and `~/cxnu` absent | n/a |
+| Local builds on this Mac | partially-working | 2026-11-21: shim/boot images (`tools/sweet-gpu-image.sh`, gcc + `mkbootimg` in `~/Developer/ios-sweet-work/bin`) and Metal (`tools/metal-build.sh`) build here; `ipsw` in `/usr/local/bin`. The kernel builds only in CI. Missing: `qemu-system-aarch64`, `img2simg`; `tools/xnu-tree.sh` says WSL, the tree is `~/Developer/ios-sweet-work/cxnu` | `fe9ca63` |
 | QEMU smoke | not-tested | no QEMU on this host; `docs/QEMU_TESTING.md` unexercised this session | n/a |
 | CPU: 8 cores (`cpus=8`), fixed clocks gold idx 10 / silver idx 8 | partially-working | `tools/sweet-gpu-image.sh` boot-args; NOTES:199, NOTES:980. README's "6 cores" is stale | 0143 |
 | CPU DVFS / idle states | not-working | roadmap D4: clocks fixed, nothing scales with load | n/a |

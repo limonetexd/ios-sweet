@@ -4,6 +4,8 @@
 
 ## Current path
 
+> 2026-11-21: this section and the Evidence table describe tree `c5d9aca` (GL only). Since then Metal is the primary path (`userland/metal/0001-0020`, `METAL_FINDINGS.md`), and GPU execution time is measured: xnu 0165 `gpu_ts=1`, 7.1 ms a submission at 1125x2436 and 1.8 ms at 750x1624, GPU busy 37-63 % at native (`TEST_LOG.md` 0171t, 0174s).
+
 1. backboardd's CoreAnimation draws through GLES. There is no Metal anywhere in this tree.
 2. `libtopaz-gl.dylib` supplies EAGLContext (donor `eagl.c` + `userland/eagl-sweet.py`), loaded by `bbd_wrap`/`topaz_inject`.
 3. GL → Mesa 25.0.7 `libOSMesa` (freedreno + softpipe), `userland/build-gpu.sh:2`. Donor source is pinned in CI, not in the tree.
@@ -25,7 +27,7 @@
 | "42 % of swaps miss the vsync tick": not reproduced. `late` means a swap gap over 20 ms (0097c), not a missed tick; normal-second values are 98.9 / 4.1 / 89.3 / 25.5 / 25.3 % for 0143r / 0143r2 / 0144r / 0146r / 0159r-rung2 | NOTES:114; logs | retracted as stated |
 | eagl profile fields, read in donor source: "in GL calls" is in-frame GL time without `glFlush`, because `frame_end` clears `in_frame` before that call returns (`eagl.c:407,1028`). "outside" is frame time minus that, so it contains the whole flush. Per frame: in GL 1.7–4.0, flush 4.4–8.4, the rest (CoreAnimation between draws) 1.0–2.6 ms. `glFlush` matches "handing on" + "waiting" to about 1 ms. Time before the first draw is not covered | logs; donor `e477291` | medium-high |
 | Per-call cost at native, cumulative per frame: `glFlush` 6.1–8.4 (of which Mesa "handing on" p50 3.9–7.0), `glTexImage2D` 3.0–4.8, `glDeleteTextures` 2.2–3.4 ms; attach ("before it") p50 2.4–3.7 ms. Slot timers are process-wide but divided by one context's frames, so slightly high. The earlier ~5.7 attach is not reproduced | logs; donor; NOTES:637-640 | medium |
-| GPU execution per frame: **no valid number**. The 0139 "worked" figure runs from ring write to first look that finds it done, so it overlaps (0143r: 232 subs/s × 19.2 ms = 4.4 s per second) and includes time nobody looked (first window averages 4.6 s with no `not done after` report) | `0083:500-523`; logs | high |
+| GPU execution per frame (as of `c5d9aca`; measured since, see the note above): **no valid number**. The 0139 "worked" figure runs from ring write to first look that finds it done, so it overlaps (0143r: 232 subs/s × 19.2 ms = 4.4 s per second) and includes time nobody looked (first window averages 4.6 s with no `not done after` report) | `0083:500-523`; logs | high |
 | Ring occupancy (newest submission unfinished ≥ 1 ms, sampled once a second, active seconds): 0143r 49 % (CI 44–54), upper 72 %, so 14.0–20.6 ms per swap; native swipe runs 15–17 %, 5.8–12.2 ms; scaled 4 %, 2.4–8.4 ms. Includes queueing | logs, 0097 `pending` | medium for 0143r; low for short runs |
 | Display readiness: GPU not done at the tick on 48 % (0143r), 34 % (0146r, 0159r-rung2), 19 % (0144r), 8 % (0143r2) of ticks with a new frame waiting; each defers that frame by 16.67 ms. On 0143r this agrees with the separate occupancy sample (48 vs 49 %) | logs, 0095/0097 `stale` | medium-high |
 | Submissions per swap: 6.6 (0143r), 5.9 (0143r2), 6.4 (0144r), 4.7 (0146r), 4.5 (0159r-rung2) | logs, fence delta | high |

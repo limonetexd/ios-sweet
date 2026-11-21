@@ -1,6 +1,19 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
-## >>> 2026-11-14 (later): the GPU is the wall at native; xnu 0164 built, booted as 0165a/0165b (results: `TEST_LOG.md` last section) <<<
+## >>> 2026-11-19 to 21: async completion, true GPU time, 750x1624 smooth (rows: `TEST_LOG.md` 0170g..0174s) <<<
+
+- Forced GMEM loses (0170g). Metal 0017 `sweetmetal_async=1`: completed handlers on a completion thread; the serial
+  wait was our own handler delivery in `-commit`, not CoreAnimation: 21.4 -> 27.4 swaps/s at native (0171a).
+- xnu 0165 `gpu_ts=1`: GPU timestamps per submission. Native: 7.1 ms a submission, 3.4 a frame, GPU busy 37-63 %
+  (0171t). So the GPU is not "the wall": CoreAnimation starts a frame at a vsync only once the previous one completed,
+  and commit-to-completion is 36-40 ms, i.e. 2-3 vsyncs a frame. The lever is GPU time per frame.
+- Neutral: metal 0018/0019 (profilers, diagnostic), 0020 DontCare discard (kept), xnu 0166 AMP + no coalescing (user:
+  worse; not used).
+- 750x1624 (`SWEET_SCALE=2`) with the same stack, real fingers (0174s): user "extremely smooth, with some freezes and
+  hangs", full screen, pixelated (nearest-neighbour), rdar status bar; GPU 1.8 ms a submission, best second 61.
+- Next: `docs/agent-progress/NEXT_PROMPT.md` (better upscale, rdar bar, 828x1792, then native GPU work).
+
+## >>> 2026-11-14 (later): the GPU is the wall at native (superseded 2026-11-20: GPU busy 37-63 %, see the entry above); xnu 0164 built, booted as 0165a/0165b (results: `TEST_LOG.md` last section) <<<
 
 The 0016 line is closed: v1 18.4, v2 19.8, control 23.7 swaps/s, and `waits`/`cbs` = 1.01 in every
 boot. The client waits for the frame's own fence after every commit (passlog `cpu 9.63` vs
