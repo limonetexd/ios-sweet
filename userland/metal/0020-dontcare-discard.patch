@@ -1,0 +1,226 @@
+--- a/tools/mesa/air/air_metal.h
++++ b/tools/mesa/air/air_metal.h
+@@ -1434,11 +1434,24 @@
+ 	 * be rebuilt together; there is no size field for either to check the other's by.
+ 	 */
+ 	const unsigned *scissor;   /* NULL, or { x, y, width, height } in pixels, origin top-left, Metal's MTLScissorRect */
++
++	/*
++	 * 0020: the pass's MTLLoadActionDontCare attachments, on the pass's first draw only: bit
++	 * i for colour attachment i, and the depth/stencil attachment when every aspect it has is
++	 * DontCare. Their contents are declared undefined, so a tiled (GMEM) batch does not read
++	 * them back into every bin first. APPENDED, like everything since the indexed forms.
++	 */
++	unsigned discard_color_mask;
++	int discard_depth;
+ };
+ 
+ int rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
+ 		    char *why, size_t why_size);
+ 
++/* 0020: attachments rwa_render_draw discarded (DontCare) and kept (a batch still writes
++ * them) since the last call; resets both. New in 0020. */
++void rwa_discard_stats(unsigned *done, unsigned *kept);
++
+ /*
+  * A pass's load actions on their own, with no pipeline and no draw: what a pass that clears
+  * and draws nothing needs, and what a pass whose colour attachments clear to DIFFERENT
+--- a/tools/mesa/air/air_metal.c
++++ b/tools/mesa/air/air_metal.c
+@@ -46,6 +46,7 @@
+ #include "null/null_sw_winsys.h"
+ #ifdef GALLIUM_FREEDRENO
+ #include "freedreno/drm/freedreno_drm_public.h"
++#include "freedreno/freedreno_resource.h"   /* 0020: fd_resource()->valid, ->track->write_batch */
+ /* for rwa_texture_from_surface: a resource over memory somebody else allocated is a
+  * winsys_handle, and the one modifier an IOSurface of this port's kernel can carry is
+  * linear (MINISURF has no tiling and no compression at all). */
+@@ -7168,6 +7169,56 @@
+                                   : finish_or_say_why(device, true, "clear", why, why_size);
+    release_pass_framebuffer(pipe, surf, color_count, zsurf);
+    return rc;
++}
++
++/*
++ * 0020: MTLLoadActionDontCare. freedreno restores an attachment into GMEM for every bin of a
++ * tiled batch whenever the resource is `valid` (freedreno_draw.c: restore_buffers), and
++ * nothing in Gallium's interface says "this pass does not want the old contents" except
++ * invalidate_resource -- which also drops the resolve of the batch still writing it, and
++ * that batch may have readers queued behind it (framebuffer changes do not flush). So this
++ * only clears `valid`, and only when no unflushed batch writes the resource: then the
++ * memory already holds everything ever stored, the next draw skips the restore
++ * (batch->invalidated) and still stores. Never on a software screen.
++ */
++static unsigned discard_done, discard_kept;
++
++static void
++discard_one(struct pipe_resource *prsc)
++{
++#ifdef GALLIUM_FREEDRENO
++   struct fd_resource *rsc = fd_resource(prsc);
++
++   if (rsc->track->write_batch == NULL) {
++      rsc->valid = false;
++      discard_done++;
++   } else {
++      discard_kept++;
++   }
++#else
++   (void)prsc;
++#endif
++}
++
++static void
++discard_pass_contents(struct rwa_device *device, const struct rwa_draw *draw)
++{
++   if (device->software)
++      return;
++   for (unsigned i = 0; i < draw->color_count && i < 32; i++)
++      if ((draw->discard_color_mask & (1u << i)) && draw->color[i] && draw->color[i]->res)
++         discard_one(draw->color[i]->res);
++   if (draw->discard_depth && draw->depth && draw->depth->res)
++      discard_one(draw->depth->res);
++}
++
++/* 0020: attachments discarded, and kept because a batch still writes them, since the last call */
++void
++rwa_discard_stats(unsigned *done, unsigned *kept)
++{
++   *done = discard_done;
++   *kept = discard_kept;
++   discard_done = discard_kept = 0;
+ }
+ 
+ int
+@@ -7468,6 +7519,9 @@
+    if (bind_pass_framebuffer(device, draw->color, draw->color_count, draw->depth, w, h,
+                              samples, surf, &zsurf, why, why_size) != 0)
+       return -1;
++   /* 0020: before the pass's first draw, its DontCare attachments */
++   if (draw->discard_color_mask || draw->discard_depth)
++      discard_pass_contents(device, draw);
+ 
+    /* The viewport, and now its z as well. Gallium's window depth is
+     * clip_z/w * scale[2] + translate[2], and with clip_halfz (the rasterizer state
+--- a/tools/mesa/air-metal.patch
++++ b/tools/mesa/air-metal.patch
+@@ -42,7 +42,7 @@
+ +  files('../../../compiler/air/air_metal.c'),
+ +  include_directories : [inc_include, inc_src, inc_mapi, inc_mesa, inc_gallium,
+ +                         inc_gallium_aux, inc_gallium_winsys_sw, inc_gallium_winsys,
+-+                         include_directories('../../drivers')],
+++                         include_directories('../../drivers'), inc_freedreno],
+ +  dependencies : [dep_m, idep_air, idep_mesautil, driver_softpipe, driver_freedreno,
+ +                  dep_libdrm],
+ +  link_with : [libgallium, libgalliumvl_stub, libws_null, libfreedrenowinsys],
+--- a/userland/src/redwoodmetal.m
++++ b/userland/src/redwoodmetal.m
+@@ -330,6 +330,9 @@
+ 	/* -setScissorRect:, NULL for none: { x, y, width, height }, origin top-left. APPENDED
+ 	 * like everything since the indexed forms, so no field above moves. */
+ 	const unsigned *scissor;
++	/* 0020: MTLLoadActionDontCare attachments, first draw of a pass only; APPENDED */
++	unsigned discard_color_mask;
++	int discard_depth;
+ };
+ /* 0013 passlog: diagnostics only; air_metal.h says what each field is */
+ struct rwa_passlog {
+@@ -579,6 +582,7 @@
+ 	int (*set_ubo_whole)(struct rwa_device *, int);       /* 0015; absent in older ones */
+ 	int (*flush)(struct rwa_device *, void **, char *, size_t);   /* 0016; absent in older */
+ 	int (*fence_done)(struct rwa_device *, void *);   /* 0017; absent in older ones */
++	void (*discard_stats)(unsigned *, unsigned *);    /* 0020; absent in older ones */
+ 	int (*wait_fence)(struct rwa_device *, void *, char *, size_t);/* 0016; absent in older */
+ } mesa;
+ 
+@@ -657,6 +661,7 @@
+ 	/* 0017: the poll the completion thread uses; absent in an older library, and then
+ 	 * sweetmetal_async=1 is ignored and says so */
+ 	*(void **)&mesa.fence_done = dlsym(mesa.handle, "rwa_fence_done");
++	*(void **)&mesa.discard_stats = dlsym(mesa.handle, "rwa_discard_stats");   /* 0020 */
+ 	if (mesa.device_open == NULL || mesa.compute_create == NULL || mesa.dispatch == NULL ||
+ 	    mesa.texture_create == NULL || mesa.sampler_create == NULL) {
+ 		/* rwa_dispatch's arguments changed when textures were added to the contract, so
+@@ -1120,6 +1125,8 @@
+ 	float clearDepth;
+ 	unsigned clearStencil;
+ 	BOOL clearsDepth, clearsStencil;
++	unsigned discardColorMask;   /* 0020: DontCare colour attachments (first draw) */
++	BOOL discardsDepth;          /* 0020: DontCare depth/stencil attachment (first draw) */
+ 	unsigned stencilReference[2];
+ 	float depthRange[2];
+ 	BOOL hasDepthRange;
+@@ -5906,6 +5913,8 @@
+ 		/* the work item's own copy, which lives as long as `work` does -- past this
+ 		 * call, which waits for the GPU */
+ 		.scissor = work->hasScissor ? work->scissor : NULL,
++		.discard_color_mask = work->discardColorMask,   /* 0020 */
++		.discard_depth = work->discardsDepth,
+ 	};
+ 
+ 	if (work->indexBuffer != nil && draw.index_buffer == NULL) {
+@@ -6192,12 +6201,20 @@
+ 	pthread_cond_broadcast(&rw_async_space);
+ 	pthread_mutex_unlock(&rw_async_mutex);
+ 	if (print) {
++		unsigned discarded = 0, kept = 0;
++
++		if (mesa.discard_stats != NULL) {   /* 0020; the library's counters, under its lock */
++			rw_lib_lock();
++			mesa.discard_stats(&discarded, &kept);
++			rw_lib_unlock();
++		}
+ 		rw_print("async: %.1f s, %llu buffers completed, mean %.0f us commit to completion, "
+-			 "%.2f polls per buffer, %llu commits waited for the bound of %d\n",
++			 "%.2f polls per buffer, %llu commits waited for the bound of %d; "
++			 "DontCare attachments discarded %u, kept %u\n",
+ 			 (double)span / 1e9, (unsigned long long)done,
+ 			 done ? (double)us / (double)done : 0.0,
+ 			 done ? (double)polls / (double)done : 0.0,
+-			 (unsigned long long)waits, RW_ASYNC_BOUND);
++			 (unsigned long long)waits, RW_ASYNC_BOUND, discarded, kept);
+ 	}
+ }
+ 
+@@ -6400,6 +6417,8 @@
+ 	float _clearDepth;
+ 	unsigned _clearStencil;
+ 	BOOL _clearsDepth, _clearsStencil;
++	unsigned _discardColorMask;   /* 0020 */
++	BOOL _discardsDepth;          /* 0020 */
+ 	unsigned _stencilReference[2];
+ 	float _depthRange[2];
+ 	BOOL _hasDepthRange;
+@@ -6469,6 +6488,9 @@
+ 			_clearColors[i][2] = (float)c.blue;
+ 			_clearColors[i][3] = (float)c.alpha;
+ 			_clearColorMask |= 1u << i;
++		} else if ([attachment loadAction] == MTLLoadActionDontCare &&
++			   [attachment texture] != nil) {
++			_discardColorMask |= 1u << i;   /* 0020 */
+ 		}
+ 	}
+ 	/*
+@@ -6503,6 +6525,11 @@
+ 			_clearStencil = (unsigned)[sa clearStencil];
+ 			_clearsStencil = YES;
+ 		}
++		/* 0020: one texture behind both descriptors, so it is discarded only when every
++		 * descriptor that names it says DontCare */
++		_discardsDepth = _depth != nil &&
++			(ztex == nil || [za loadAction] == MTLLoadActionDontCare) &&
++			(stex == nil || [sa loadAction] == MTLLoadActionDontCare);
+ 	}
+ 	return self;
+ }
+@@ -6739,6 +6766,10 @@
+ 	work->clearStencil = _clearStencil;
+ 	work->clearsDepth = _clearsDepth;
+ 	work->clearsStencil = _clearsStencil;
++	work->discardColorMask = _discardColorMask;   /* 0020: the first draw only */
++	work->discardsDepth = _discardsDepth;
++	_discardColorMask = 0;
++	_discardsDepth = NO;
+ 	_clearColorMask = 0;
+ 	_clearsDepth = NO;
+ 	_clearsStencil = NO;
