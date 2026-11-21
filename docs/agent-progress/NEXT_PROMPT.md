@@ -1,17 +1,20 @@
-> State 2026-11-20 (records through the 0171t row of `TEST_LOG.md`).
-> - Best at native 1125x2436: 0171a/0171t = kernel 0164/0165 + `gpu_slack=1` + metal 0017 `sweetmetal_async=1`: 27.4-27.7 swaps/s, best second 51-52, 0 faults (one boot each, `experimental`, picture NOT yet confirmed by the user). Phone root = `work1.raw` + 0017 binaries (rollback `~/Developer/ios-sweet-work/root/rollback-0016`).
-> - True GPU time (xnu 0165 `gpu_ts=1`): ~21 ms of execution a frame (3.4 submissions x 7.2 ms), GPU busy only 37-63 %. Forced GMEM (0170g) loses: keep the autotuner.
-> - Kernel 0165 in `~/Developer/ios-sweet-work/kernel-0165/xnu-kernel`. CI `xnu` runs on `gpu` only by `gh workflow run xnu.yml --ref gpu`.
-> - Read first: `UPSTREAM_SURVEY-2026-11-19.md`, the last three sections of `TEST_LOG.md`.
-> - Traps: image builds need `PATH=$HOME/Developer/ios-sweet-work/bin:$PATH` and `bash tools/...`; check sha256 and `rg -a -o NAME=` in the image. `SWEET_SERIAL=f492cad9` for boot tests.
+> State 2026-11-21 (records through the 0174s row of `TEST_LOG.md`; branch `gpu`, pushed).
+> - **Smooth config (user-confirmed, one boot):** 0174s = kernel 0165 (`~/Developer/ios-sweet-work/kernel-0165/xnu-kernel`, SMP) + `SWEET_SCALE=2` (750x1624) + metal 0017 `sweetmetal_async=1` + `gpu_slack=1`: "extremely smooth, with some freezes and hangs", best second 61, GPU 1.8 ms a submission. Faults: pixelated (nearest-neighbour 1.5x CPU upscale), rdar status bar, freezes/hangs.
+> - Native 1125x2436 with the same stack: ~27 swaps/s (0171a/0173d), GPU 7.1 ms a submission x 3.4 a frame.
+> - Pacing model (fits every boot): CoreAnimation starts a frame at a vsync only when the previous one completed; commit-to-completion is 36-40 ms at native, so frames take 2-3 vsyncs. CPU-side changes (async, AMP, coalescing, DontCare) barely move it. The lever is GPU time per frame.
+> - Closed: forced GMEM (0170g worse), xnu 0166 AMP+no coalescing (0174a: no gain, user "worse"; kernel kept in `kernel-0166` but not used), metal 0020 DontCare discard (correct, neutral, kept), CPUMAX (small).
+> - Phone root = `work1.raw` + metal 0017-0020 binaries (diagnostic 0018/0019 `sweetmetal_prof=2/3` are off unless asked). Rollbacks: `~/Developer/ios-sweet-work/root/rollback-0016`.
+> - Tools: `bash tools/...`, `PATH=$HOME/Developer/ios-sweet-work/bin:$PATH`; flashes/boots run detached (`nohup ... & disown`, log in `logs/`) because a dying session killed a flash once; `SWEET_SERIAL=f492cad9`. Userdata flash = `tools/metal-flash-test.sh work1.raw IMAGE TAG 420` (~20 min). CI kernel: `gh workflow run xnu.yml -R limonetexd/ios-sweet-gpu --ref gpu`.
+> - Read first: `SMOOTH_PORTS-2026-11-21.md`, `UPSTREAM_SURVEY-2026-11-19.md`, last five sections of `TEST_LOG.md`.
 
-> - 2026-11-20 13:00: phone LOST from USB (not in fastboot, not adb) after the 0172p userdata flash was interrupted twice (session ended mid-flash at ~01:00). userdata may be half-written: re-run `tools/metal-flash-test.sh work1.raw shim/out/shim-boot-0172p.img 0172p 420` once the phone is in fastboot (Power+Vol-down; charge it first). 0172p = 0171t + metal 0018 `sweetmetal_prof=2` (whole-thread profile of CA's render thread), not booted yet.
+# Next phase (lead: Opus/Fable): keep 750x1624's smoothness, at a better picture
 
-# Next phase (lead: Fable or Opus): GPU work per frame at native, and the idle 40 %
+User question: "is it possible to achieve this smoothness on higher resolution?" Answer so far: yes in steps. Do them in this order, one change per boot, user looks at each:
 
-0. Ask the user to look at one 0171a-style boot and confirm the picture (no tearing, no stale frames, apps open/close). Until then 0017 stays default off.
-1. Where the 21 ms goes: per-pass GPU time. Extend the passlog (metal 0013) or the 0165 timestamps to tag each submission with its pass (attachment size, draws, gmem/sysmem) and log the top passes per 5 s. Compare with HakiOS (`metal-measurements.md`: full-screen home pass 6-13 ms; luma_boost was 83 % of their GPU passes; wallpaper_freeze home 50 -> 92).
-2. The idle 40 %: what the GPU waits for between submissions (kernel flush 1.3 ms a submission, take 2.2 ms, present 3.4 ms; 3.4 submissions a frame = three flush points). Candidates from DC28088 (same phone): no per-submission cache cleans of imported surfaces (their 0174: ioctl 2400 -> 605 us), page-flip/GPU present copy.
-3. One change, one boot, record, stop.
+1. **Better upscale at 750x1624** (fixes "pixelated" now): bilinear instead of nearest in the kernel's panel copy (HakiOS: nearest while moving, bilinear when still; their `fb_filter=1` cost late shares), or an A6xx 2D-engine scaled blit (mesa `fd6_blitter.cc`, DC28088's plan) that also frees the CPU copy. Find the copy in `SweetFramebuffer.cpp` (`present()`, copy helper threads).
+2. **rdar status bar at 750x1624:** HakiOS `inject_sb.c` makes SpringBoard's fallback status bar the iPhone X's; DC28088 found a MobileGestalt cache must match the canvas.
+3. **Intermediate size 828x1792 @2x** (iPhone XR class, `fbsubtype=1792`; HakiOS 118 fps scroll, no rdar bar): 1.53x the pixels of 750x1624, still 1.85x fewer than native.
+4. **Native:** cut GPU work per frame below ~12 ms: per-pass GPU timing (extend xnu 0165 timestamps per submission with the pass's size/draws), then the heavy passes (blur, wallpaper: HakiOS `wallpaper_freeze`).
+5. **Freezes/hangs** at 750x1624: catch one in a log (SWEET FPS `longest`, `not done after`, SpringBoard main thread with `sweetmetal_prof=3`).
 
-Still open: defaults for `gpu_slack=1`, `sweet_surfclear_ms=0`, `sweetmetal_async=1` (need more than one boot and the user's eye); thermal cap before `SWEET_CPUMAX=1`.
+Rules: RAM boots only unless userdata must change; state the rung; record a `TEST_LOG.md` row per boot; stop at the phase end and rewrite this file.

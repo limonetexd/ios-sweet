@@ -592,3 +592,11 @@ Verdict (one boot each, `experimental`): no thread is saturated -- CA's render t
 | 2026-11-21 | kernel 0166 (CI 44906330014, `7b778d1`), AMP ADT (`SWEET_AMP=1`), `shim-boot-0174a.img` (`02d1975e...`), 0173d's flags | detached `SWEET_SERIAL=f492cad9 tools/sweet-boot-test.sh ... 0174a 420` | UI threads on the A76s: more frames | boots, 0 fault lines; **27.2 swaps/s** (0173d 27.5), cpu/cb **9.06 ms** (8.32), GPU busy 50.8 %, exec 7.30 ms; **user: "now it's worse"** | `logs/xnu-0174a.txt` |
 
 Verdict: AMP (with spill -32) and no coalescing do not help here and the user sees it as worse. Not used; kernel 0165 (SMP) stays. Model that fits every boot so far: CoreAnimation starts a frame at a vsync only when the previous one has completed, and commit-to-completion is 36-40 ms at native (async line), so frames take 2-3 vsyncs (~27/s) whatever the CPU side does. The lever is GPU time per frame (21-25 ms at native). Next: 750x1624 (0174s), user watching.
+
+## 750x1624 with the current stack, real fingers (0174s), 2026-11-21 (RAM boot, kernel 0165 SMP, root as 0173d)
+
+| Date | Build | Procedure | Expected | Actual | Artifacts |
+| --- | --- | --- | --- | --- | --- |
+| 2026-11-21 | `shim-boot-0174s.img` (`f0ae6267...`), `SWEET_SCALE=2`, 0173d's flags without `sweetgpu_swipe`, `sweetgpu_reboot=600` | detached `tools/sweet-boot-test.sh ... 0174s 720`; the user used the phone | full screen draws; smoother than native | **user: "extremely smooth, with some freezes and hangs", full screen (no strip), pixelated (nearest-neighbour 1.5x), rdar status bar**; 0 fault lines; best second **61** swaps, 38.7/s over 34 active s; GPU busy 13.7 %, exec **1.81 ms** a submission (native 7.1), cpu/cb 5.18 ms, present 4.6 ms | `logs/xnu-0174s.txt` |
+
+Verdict (one boot, user-confirmed picture): the pacing model holds -- with GPU work per frame cut ~4x, frames make the vsync. 750x1624 is the first configuration the user calls smooth. Native costs 4x the GPU time for 2.25x the pixels (superlinear: bandwidth), so native needs the GPU work itself cut.
