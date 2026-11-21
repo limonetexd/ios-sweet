@@ -584,3 +584,11 @@ Verdict: the render server waits to be given work most of the frame; neither its
 | 2026-11-21 | metal 0017-0020 (`libredwoodair` `ca1963c9...`), `shim-boot-0173d.img` (`a1e9e247...`), exactly 0171t's flags | detached `tools/metal-flash-test.sh ... 0173d 420` | DontCare attachments not restored into GMEM: less GPU time | 0 fault lines; async line: **339-451 attachments discarded / 5 s, 0 kept**; **27.5 swaps/s** (0171t 27.7), GPU busy 44.2 %, exec 7.10 ms a submission (7.17) | `logs/xnu-0173d.txt` |
 
 Verdict (one boot each, `experimental`): no thread is saturated -- CA's render thread 32 %, SpringBoard's main thread 16 %, GPU 44 % -- yet frames are ~36 ms apart, so the frame is a latency chain (wake-ups, core placement, timers), not a throughput limit. 0020 is correct and neutral here (most of our batches are sysmem); kept. Next: xnu 0166 (AMP + no timer coalescing).
+
+## AMP scheduling + no timer coalescing (xnu 0166), 0174a, 2026-11-21 (RAM boot, root as 0173d)
+
+| Date | Build | Procedure | Expected | Actual | Artifacts |
+| --- | --- | --- | --- | --- | --- |
+| 2026-11-21 | kernel 0166 (CI 44906330014, `7b778d1`), AMP ADT (`SWEET_AMP=1`), `shim-boot-0174a.img` (`02d1975e...`), 0173d's flags | detached `SWEET_SERIAL=f492cad9 tools/sweet-boot-test.sh ... 0174a 420` | UI threads on the A76s: more frames | boots, 0 fault lines; **27.2 swaps/s** (0173d 27.5), cpu/cb **9.06 ms** (8.32), GPU busy 50.8 %, exec 7.30 ms; **user: "now it's worse"** | `logs/xnu-0174a.txt` |
+
+Verdict: AMP (with spill -32) and no coalescing do not help here and the user sees it as worse. Not used; kernel 0165 (SMP) stays. Model that fits every boot so far: CoreAnimation starts a frame at a vsync only when the previous one has completed, and commit-to-completion is 36-40 ms at native (async line), so frames take 2-3 vsyncs (~27/s) whatever the CPU side does. The lever is GPU time per frame (21-25 ms at native). Next: 750x1624 (0174s), user watching.
