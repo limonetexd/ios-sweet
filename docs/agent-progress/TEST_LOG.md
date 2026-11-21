@@ -567,3 +567,11 @@ Verdict (one boot, `experimental`, picture not confirmed by the user): the seria
 | 2026-11-20 | kernel 0165 (`kernel-0165/xnu-kernel`), `shim-boot-0171t.img` (`361dde96...`), 0171a flags + `gpu_ts=1` | `SWEET_SERIAL=f492cad9 tools/sweet-boot-test.sh ... 0171t 420` | timestamps per submission; counter ~19.2 MHz | 0 SMMU/FAR/`THE GPU DID NOT`; `GPU timestamps on (0165)`; counter **19.20 MHz** (CPU vs mach time); GPU **busy 37-63 %** per active 5 s window (43.8 % over the boot); exec **7.17 ms** mean over 14017 submissions, ~83 submissions/s = 3.4 per cb; 27.7 swaps/s, best 52 (same as 0171a: the instrumentation costs nothing visible) | `logs/xnu-0171t.txt` |
 
 Verdict (one boot, `experimental`): the GPU executes ~21 ms per native frame (58 % of a 36 ms frame) and is idle the rest. "GPU 18.9/33 ms a submission" from `the GPU worked` was queueing, not execution. 60 fps at native needs both less GPU work per frame (below 16.7 ms) and the idle ~40 % filled (CPU 8.3 ms/cb, kernel flush 1.3 ms x 3.4 submissions, take 2.2 ms, present 3.4 ms are still in the frame's path).
+
+## Whole-thread profile of CoreAnimation's render thread (metal 0018 `sweetmetal_prof=2`), 0172p, 2026-11-21 (userdata flashed, RAM boot, kernel 0165)
+
+| Date | Build | Procedure | Expected | Actual | Artifacts |
+| --- | --- | --- | --- | --- | --- |
+| 2026-11-21 | root `work1.raw` + metal 0017+0018, `shim-boot-0172p.img` (`f4577835...`), 0171t flags + `sweetmetal_prof=2` | detached `tools/metal-flash-test.sh ... 0172p 420` (log `logs/flash-0172p.log`) | where backboardd's render thread spends a 36 ms frame | 0 fault lines; 26.1 swaps/s under 1 kHz sampling; backboardd's first committing thread: 157690 samples, **running 32 %, waiting 68 %**, leaf `mach_msg2_trap` 125716 (80 %); ~14.6 ms of thread CPU a frame (encode + 9.5 ms commit); top own code `rwa_render_draw`, `rwa_flush`, `rwa_texture_from_surface` | `logs/xnu-0172p.txt` |
+
+Verdict: the render server waits to be given work most of the frame; neither its CPU nor the GPU (40-60 % busy) paces the frame. Only VSYNC notifications are sent by `SweetFramebuffer` (no swap-complete gate). Next: sample the main threads (metal 0019 `sweetmetal_prof=3`): SpringBoard's main thread is the suspected pacer during swipes (also HakiOS's and DC28088's remaining limit).
