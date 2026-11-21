@@ -1,0 +1,132 @@
+Subject: metal 0022: function constants undefined unless set (boot-arg sweetmetal_fc_undef=1)
+
+Every function constant a module declares was passed to air_to_nir as defined with value 0,
+so air.is_function_constant_defined was always true. Metal says false for a constant the app
+did not set, and QuartzCore's uber shaders take their defaults from that (fixed_frag_lph_cph:
+fc_blend_function undefined -> 54, the vertex colour; defined 0 -> (0,0,0,0); metaltest 18/19).
+sweetmetal_fc_undef=1 passes no constants; air_to_nir reads an undefined one as 0. Default off.
+
+--- a/tools/mesa/air/air_metal.c
++++ b/tools/mesa/air/air_metal.c
+@@ -1048,8 +1048,60 @@
+    if (on < 0) {
+       const char *v = getenv("RWA_PACKED16");
+       on = !(v && *v == '0');
++   }
++   return on != 0;
++}
++
++/*
++ * 0022: which function constants a pipeline is compiled with.
++ *
++ * The app's MTLFunctionConstantValues never reach this library (redwoodmetal.m has no
++ * path for them), so every constant a module declares used to be passed as DEFINED with
++ * value 0. Metal answers air.is_function_constant_defined false for a constant the app
++ * did not set, and QuartzCore's uber shaders pick their defaults from that answer:
++ * fixed_frag_lph_cph takes fc_blend_function = 54 (the vertex colour) when it is
++ * undefined, and draws (0,0,0,0) with a defined 0 (RESEARCH_LEDGER 2026-11-21).
++ *
++ * Boot-arg sweetmetal_fc_undef=1 passes no constants at all: each one is undefined, and
++ * air_to_nir reads an undefined one as 0. Anything else (absent included) keeps every
++ * constant defined as 0, the behaviour before 0022. Decided once per process, said once.
++ */
++#include <sys/types.h>
++#include <sys/sysctl.h>
++
++#define RWA_FC_UNDEF_KEY "sweetmetal_fc_undef="
++
++static bool
++fc_undefined(void)
++{
++   static int on = -1;
++   if (on < 0) {
++      char args[1024] = "";
++      size_t size = sizeof(args) - 1;
++      const char *at = NULL;
++      if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0) {
++         for (at = args; (at = strstr(at, RWA_FC_UNDEF_KEY)) != NULL;
++              at += strlen(RWA_FC_UNDEF_KEY))
++            if (at == args || at[-1] == ' ')
++               break;
++      }
++      on = at != NULL && at[strlen(RWA_FC_UNDEF_KEY)] == '1';
++      fprintf(stderr, "libredwoodair: function constants: %s\n",
++              on ? "UNDEFINED unless set (boot-arg sweetmetal_fc_undef=1)" :
++                   "every one defined as 0 (sweetmetal_fc_undef=1 leaves them undefined)");
+    }
+    return on != 0;
++}
++
++static unsigned
++pipeline_function_constants(void *mem_ctx, const void *bitcode, size_t size,
++                            struct air_constant_value **out)
++{
++   if (fc_undefined()) {
++      *out = NULL;
++      return 0;
++   }
++   return air_module_function_constants(mem_ctx, bitcode, size, out);
+ }
+ 
+ static const struct rwa_pixel_format *
+@@ -2932,7 +2984,7 @@
+     */
+    struct air_constant_value *constants;
+    unsigned num_constants =
+-      air_module_function_constants(compute->mem_ctx, bitcode, size, &constants);
++      pipeline_function_constants(compute->mem_ctx, bitcode, size, &constants);
+ 
+    /* library_wrapper is false, unlike air_run --library: a wrapped air.visible function
+     * is a shader made up to be measurable, not a pipeline anyone can dispatch. Metal
+@@ -4515,7 +4567,7 @@
+     */
+    struct air_constant_value *constants;
+    unsigned num_constants =
+-      air_module_function_constants(mem_ctx, bitcode, size, &constants);
++      pipeline_function_constants(mem_ctx, bitcode, size, &constants);
+    const struct air_to_nir_options options = {
+       .constants = constants,
+       .num_constants = num_constants,
+@@ -4662,7 +4714,7 @@
+     */
+    struct air_constant_value *constants;
+    unsigned num_constants =
+-      air_module_function_constants(mem_ctx, bitcode, size, &constants);
++      pipeline_function_constants(mem_ctx, bitcode, size, &constants);
+    const struct air_to_nir_options options = {
+       .constants = constants,
+       .num_constants = num_constants,
+@@ -6461,7 +6513,7 @@
+     */
+    struct air_constant_value *ffc;
+    unsigned num_ffc =
+-      air_module_function_constants(render->mem_ctx, fragment_bitcode, fragment_size, &ffc);
++      pipeline_function_constants(render->mem_ctx, fragment_bitcode, fragment_size, &ffc);
+    const struct air_to_nir_options fopts = {
+       .constants = ffc, .num_constants = num_ffc,
+       .keep_16bit_varyings = shape->keep_16bit_varyings != 0,
+@@ -6538,7 +6590,7 @@
+       }
+       struct air_constant_value *vfc;
+       unsigned num_vfc =
+-         air_module_function_constants(render->mem_ctx, vertex_bitcode, vertex_size, &vfc);
++         pipeline_function_constants(render->mem_ctx, vertex_bitcode, vertex_size, &vfc);
+       const struct air_to_nir_options vopts = {
+          .constants = vfc, .num_constants = num_vfc,
+          .keep_16bit_varyings = shape->keep_16bit_varyings != 0,
+--- a/tools/mesa/air/air_to_nir.c
++++ b/tools/mesa/air/air_to_nir.c
+@@ -540,8 +540,12 @@
+       for (unsigned i = 0; c->options && i < c->options->num_constants; i++)
+          if (c->options->constants[i].index == ptr.binding)
+             v = &c->options->constants[i];
++      /* 0022: a constant the pipeline did not set is undefined in Metal --
++       * air.is_function_constant_defined says false for it (fc_defined_op) --
++       * and its value is then unspecified; 0 is the one this frontend gives. */
++      static const struct air_constant_value undefined_constant = { 0 };
+       if (!v)
+-         return air_error(c, "interface: function constant %u has no value", ptr.binding), NULL;
++         v = &undefined_constant;
+       if (comps == 1) {
+          res = nir_imm_intN_t(&c->b, v->bits, as_bool ? 8 : bits);
+          break;

@@ -896,7 +896,8 @@ caQuad(NSString *vsName, NSString *fsName)
 
 	id<MTLTexture> t = newTarget();
 	id<MTLCommandBuffer> cb = t ? [g_q commandBuffer] : nil;
-	id<MTLRenderCommandEncoder> e = cb ? beginPass(cb, t, MTLClearColorMake(0, 0, 0, 1), nil) : nil;
+	/* clear grey 404040ff, no vertex colour: "drew nothing" reads grey, "drew black" black */
+	id<MTLRenderCommandEncoder> e = cb ? beginPass(cb, t, MTLClearColorMake(0.25, 0.25, 0.25, 1), nil) : nil;
 	if (!e) {
 		return fail("render encoder nil");
 	}
