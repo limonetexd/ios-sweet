@@ -600,3 +600,11 @@ Verdict: AMP (with spill -32) and no coalescing do not help here and the user se
 | 2026-11-21 | `shim-boot-0174s.img` (`f0ae6267...`), `SWEET_SCALE=2`, 0173d's flags without `sweetgpu_swipe`, `sweetgpu_reboot=600` | detached `tools/sweet-boot-test.sh ... 0174s 720`; the user used the phone | full screen draws; smoother than native | **user: "extremely smooth, with some freezes and hangs", full screen (no strip), pixelated (nearest-neighbour 1.5x), rdar status bar**; 0 fault lines; best second **61** swaps, 38.7/s over 34 active s; GPU busy 13.7 %, exec **1.81 ms** a submission (native 7.1), cpu/cb 5.18 ms, present 4.6 ms | `logs/xnu-0174s.txt` |
 
 Verdict (one boot, user-confirmed picture): the pacing model holds -- with GPU work per frame cut ~4x, frames make the vsync. 750x1624 is the first configuration the user calls smooth. Native costs 4x the GPU time for 2.25x the pixels (superlinear: bandwidth), so native needs the GPU work itself cut.
+
+## Bilinear scaled copy (xnu 0167 `sweetfb_filter=1`), 0175b, 2026-11-21 (RAM boot, kernel 0165+0167 SMP, root as 0173d)
+
+| Date | Build | Procedure | Expected | Actual | Artifacts |
+| --- | --- | --- | --- | --- | --- |
+| 2026-11-21 | kernel 0165+0167 (CI 44911948012, `5262c1a`; 0166 parked in `patches-pending`), `SWEET_SCALE=2`, `SWEETFB_HZ=60`, 0174s's flags + `sweetfb_filter=1`, `shim-boot-0175b.img` (`956087e5...`) | detached `SWEET_SERIAL=f492cad9 tools/sweet-boot-test.sh ... 0175b 720` | sharper picture, 0174s smoothness | boots, "scaled copy filter bilinear", 0 fault lines; **copy 28.8-29.9 ms a frame** on 3 processors (0174s present 4.6 ms); best second **5 swaps** (0174s 61) | `logs/xnu-0175b.txt` |
+
+Verdict (one boot, `not-working` for smoothness): GPU-pool surfaces are mapped write-combined (`SweetSurface.cpp` kIOMapWriteCombineCache), so the copy's source loads are uncached; bilinear does 4 per panel pixel (nearest 1), ~6x the copy time, which then gates every frame. Fix: read each source row once, sequentially, into a cached line buffer and blend from it (0168).
