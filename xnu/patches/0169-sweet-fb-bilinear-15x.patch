@@ -1,0 +1,74 @@
+From: HakiOS
+Subject: [PATCH 0169] sweet: exact 1.5x scaled copy as p, avg(p,q), q (cheap linear filter)
+
+The general bilinear copy (0167/0168, sweetfb_filter=1) takes ~29 ms a frame on the A55
+copiers (0175b, 0175c), nearest 4.5 ms (0175d): the cost is the blend arithmetic, not the
+uncached source reads. 750x1624 crops to 720x1600 and scales exactly 1.5x to 1080x2400, so
+with sweetfb_filter=1 and an exact 3:2 rect each source pair p, q becomes p, avg(p,q), q
+across and down (linear at phases 0 and 1/2, a per-channel floor average in 2-4 integer ops a
+pixel). Other ratios keep the 0167/0168 path; sweetfb_filter=0 keeps nearest.
+Host test: avg and the row expansion match a per-channel reference over 2M random pixels.
+Not compiled locally; CI is the compiler.
+---
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index a606c6a..2458be0 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1256,6 +1256,35 @@ sweet_fb_load_row(const SweetCopyJob *job, uint32_t *slot, uint32_t row)
+ 	    (size_t)job->scaleSrcW * 4);
+ }
+ 
++/* 0169: per-channel floor((x + y) / 2), no carry between channels */
++static inline uint32_t
++sweet_fb_avg(uint32_t x, uint32_t y)
++{
++	return (x & y) + (((x ^ y) >> 1) & 0x7F7F7F7Fu);
++}
++
++/*
++ * 0169: the exact 1.5x case (720x1600 -> 1080x2400): each pair of source pixels p, q becomes
++ * p, avg(p, q), q; with b, the row is first the average of rows a and b. Linear interpolation at
++ * phases 0 and 1/2 for 2 integer ops a pixel, where the general bilinear path took ~29 ms a frame
++ * on the A55 copiers (0175b/0175c; nearest 4.5 ms, 0175d).
++ */
++static inline void
++sweet_fb_row15(uint32_t *d, const uint32_t *a, const uint32_t *b, uint32_t srcW)
++{
++	for (uint32_t i = 0; i + 1 < srcW; i += 2) {
++		uint32_t p = a[i], q = a[i + 1];
++		if (b != NULL) {
++			p = sweet_fb_avg(p, b[i]);
++			q = sweet_fb_avg(q, b[i + 1]);
++		}
++		d[0] = p;
++		d[1] = sweet_fb_avg(p, q);
++		d[2] = q;
++		d += 3;
++	}
++}
++
+ static void
+ sweet_fb_copy_band(SweetCopyJob *job, uint32_t band, uint32_t *lineBuf)
+ {
+@@ -1293,7 +1322,20 @@ sweet_fb_copy_band(SweetCopyJob *job, uint32_t band, uint32_t *lineBuf)
+ 			redwood_gpu_to_memory((void *)src, (uint64_t)(y1 - y0) * job->srcRowBytes);
+ 		}
+ 	}
+-	if (job->scale && job->bilinear) {
++	if (job->scale && job->bilinear && (job->scaleSrcW & 1) == 0 && (job->scaleSrcH & 1) == 0 &&
++	    job->scaleDstW * 2 == job->scaleSrcW * 3 && job->scaleDstH * 2 == job->scaleSrcH * 3) {
++		/*
++		 * 0169: dst row 3k is source row 2k, 3k+1 the average of 2k and 2k+1, 3k+2 row 2k+1
++		 * (all inside the 0167 invalidate span of the band). Each panel pixel written once, in order.
++		 */
++		for (uint32_t y = y0; y < y1; y++) {
++			uint32_t k = y / 3, ph = y - 3 * k;
++			const uint32_t *r0 = (const uint32_t *)(job->srcRows + (uint64_t)(2 * k) * job->srcRowBytes + job->srcColumn);
++			const uint32_t *r1 = (const uint32_t *)((uintptr_t)r0 + job->srcRowBytes);
++			uint32_t *drow = (uint32_t *)(dst + (uint64_t)(y - y0) * job->dstRowBytes);
++			sweet_fb_row15(drow, ph == 2 ? r1 : r0, ph == 1 ? r1 : NULL, job->scaleSrcW);
++		}
++	} else if (job->scale && job->bilinear) {
+ 		/* 0167: each panel pixel written once, in order; the panel is never read */
+ 		/*
+ 		 * 0168: with a line buffer, two slots tagged with the source row they hold (none at the
