@@ -840,10 +840,11 @@ caQuad(NSString *vsName, NSString *fsName)
 		return fail("function nil (vs %s, fs %s)", vs ? "ok" : "nil", fs ? "ok" : "nil");
 	}
 	MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
-	static const MTLVertexFormat fmts[4] = { MTLVertexFormatFloat4, MTLVertexFormatFloat2,
-		MTLVertexFormatFloat2, MTLVertexFormatHalf4 };
-	static const NSUInteger offs[4] = { 0, 16, 24, 32 };
-	for (NSUInteger i = 0; i < 4; i++) {
+	/* attribute 4 is point_size (float), read by fixed_vert_*_spc: at offset 40, 1.0 */
+	static const MTLVertexFormat fmts[5] = { MTLVertexFormatFloat4, MTLVertexFormatFloat2,
+		MTLVertexFormatFloat2, MTLVertexFormatHalf4, MTLVertexFormatFloat };
+	static const NSUInteger offs[5] = { 0, 16, 24, 32, 40 };
+	for (NSUInteger i = 0; i < 5; i++) {
 		vd.attributes[i].format = fmts[i];
 		vd.attributes[i].offset = offs[i];
 		vd.attributes[i].bufferIndex = 1;
@@ -889,6 +890,7 @@ caQuad(NSString *vsName, NSString *fsName)
 		f[4] = f[6] = (pos[v][0] + 1) * 0.5f;   /* texcoords: unused by the colour, but defined */
 		f[5] = f[7] = (1 - pos[v][1]) * 0.5f;
 		memcpy(m + VOFF + v * 48 + 32, col[v], 8);
+		f[10] = 1.0f;   /* point_size */
 	}
 	memcpy(m + IOFF, idx, sizeof(idx));
 

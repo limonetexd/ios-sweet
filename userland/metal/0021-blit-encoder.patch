@@ -1,0 +1,1011 @@
+Subject: metal 0021: blit encoder (texture/buffer copies, mipmaps, fill)
+
+MTLBlitCommandEncoder for the Metal driver, recorded like the compute encoder and run in
+order at -commit. Library (tools/mesa/air/air_metal.[ch]): rwa_texture_copy and
+rwa_buffer_copy (pipe->resource_copy_region), rwa_texture_gen_mipmap (util_gen_mipmap,
+linear), rwa_buffer_fill (pipe->clear_buffer, else map+memset after a finish); each waits
+like rwa_render_clear (deferred under rwa_set_deferred_wait). Driver
+(userland/src/redwoodmetal.m): RedwoodMetalBlitEncoder; texture<->buffer copies by the
+CPU at replay time (rwa_finish, then rwa_texture_read/rwa_texture_write per image with
+bytesPerRow); sync/fence/optimize selectors are no-ops. -blitCommandEncoder answers nil
+when the library lacks any of the four calls (older library: unchanged behaviour).
+
+diff --git a/tools/mesa/air/air_metal.h b/tools/mesa/air/air_metal.h
+index ffe4191..f773fbb 100644
+--- a/tools/mesa/air/air_metal.h
++++ b/tools/mesa/air/air_metal.h
+@@ -1469,6 +1469,38 @@ int rwa_render_clear(struct rwa_device *device, struct rwa_texture *const *color
+ 		     const float *clear_depth, const unsigned *clear_stencil,
+ 		     char *why, size_t why_size);
+ 
++/*
++ * 0021: what MTLBlitCommandEncoder asks of the GPU. Each is queued on the device's context
++ * and waited for like rwa_render_clear: at once, or with rwa_set_deferred_wait on by the
++ * caller's next rwa_finish or rwa_flush. 0, or -1 and a sentence. New in 0021: absent in
++ * older libraries.
++ *
++ * rwa_texture_copy: `size` texels (NULL: the whole source level) from `src_origin` of
++ * level/slice of `src` to `dst_origin` of level/slice of `dst`. A NULL origin is (0,0,0).
++ * The texels move as bytes, so both formats must have the same texel size and kind
++ * (colour, or depth/stencil) and the same sample count.
++ */
++int rwa_texture_copy(struct rwa_device *device, struct rwa_texture *src, unsigned src_level,
++		     unsigned src_layer, const unsigned src_origin[3], const unsigned size[3],
++		     struct rwa_texture *dst, unsigned dst_level, unsigned dst_layer,
++		     const unsigned dst_origin[3], char *why, size_t why_size);
++
++/* 0021: `size` bytes from `src_offset` of `src` to `dst_offset` of `dst`, on the GPU. Two
++ * ranges of one buffer must not overlap. */
++int rwa_buffer_copy(struct rwa_device *device, struct rwa_buffer *src, size_t src_offset,
++		    struct rwa_buffer *dst, size_t dst_offset, size_t size,
++		    char *why, size_t why_size);
++
++/* 0021: every level of `texture` after the first, each a linear reduction of the one
++ * before, over every slice. A texture of one level is 0 and touches nothing. */
++int rwa_texture_gen_mipmap(struct rwa_device *device, struct rwa_texture *texture,
++			   char *why, size_t why_size);
++
++/* 0021: `size` bytes at `offset` of `buffer` set to `value`: on the GPU when the driver has
++ * a fill, otherwise through the buffer's mapping after the queued work has finished. */
++int rwa_buffer_fill(struct rwa_device *device, struct rwa_buffer *buffer, size_t offset,
++		    size_t size, unsigned char value, char *why, size_t why_size);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/tools/mesa/air/air_metal.c b/tools/mesa/air/air_metal.c
+index a1d34d0..3967fca 100644
+--- a/tools/mesa/air/air_metal.c
++++ b/tools/mesa/air/air_metal.c
+@@ -59,6 +59,7 @@
+ #include "util/format/u_format.h"
+ #include "util/half_float.h"
+ #include "util/u_inlines.h"
++#include "util/u_gen_mipmap.h"   /* 0021: rwa_texture_gen_mipmap */
+ #include "util/u_sampler.h"
+ #include "util/u_debug.h"
+ 
+@@ -7746,3 +7747,163 @@ unbind:
+    release_pass_framebuffer(pipe, surf, draw->color_count, zsurf);
+    return rc;
+ }
++
++/*
++ * 0021: the blit encoder's GPU half. Each is one Gallium call on the device's one context,
++ * made under the plug-in's library lock like every other call here, and waited for the way a
++ * clear is: at once, or -- with rwa_set_deferred_wait on -- by the caller's one rwa_finish or
++ * rwa_flush at the end of the command buffer. What a call refuses it refuses by name and
++ * before Gallium is asked, because freedreno programs what it is given.
++ */
++static int
++blit_wait(struct rwa_device *device, const char *what, char *why, size_t why_size)
++{
++   return device->deferred_wait ? 0 : finish_or_say_why(device, true, what, why, why_size);
++}
++
++int
++rwa_texture_copy(struct rwa_device *device, struct rwa_texture *src, unsigned src_level,
++                 unsigned src_layer, const unsigned src_origin[3], const unsigned size[3],
++                 struct rwa_texture *dst, unsigned dst_level, unsigned dst_layer,
++                 const unsigned dst_origin[3], char *why, size_t why_size)
++{
++   struct pipe_box sbox, dbox;
++
++   if (!device || !src || !dst) {
++      say(why, why_size, "a texture copy with no %s",
++          !device ? "device" : !src ? "source texture" : "destination texture");
++      return -1;
++   }
++   if (src->device != device || dst->device != device) {
++      say(why, why_size, "a texture copy between textures of another device");
++      return -1;
++   }
++   /* resource_copy_region copies bytes, not texels it converts: the two formats have to
++    * agree on how many bytes a texel is, and on how many samples one holds */
++   if (util_format_get_blocksize(src->res->format) !=
++          util_format_get_blocksize(dst->res->format) ||
++       util_format_is_depth_or_stencil(src->res->format) !=
++          util_format_is_depth_or_stencil(dst->res->format)) {
++      say(why, why_size, "a copy from %s into %s: a texture copy moves texels as they are, "
++                         "so the two formats must have the same size and kind of texel",
++          src->format_name, dst->format_name);
++      return -1;
++   }
++   if (MAX2(src->res->nr_samples, 1) != MAX2(dst->res->nr_samples, 1)) {
++      say(why, why_size, "a copy between textures of %u and %u samples per texel",
++          MAX2(src->res->nr_samples, 1), MAX2(dst->res->nr_samples, 1));
++      return -1;
++   }
++   if (!texture_box(src, src_level, src_layer, src_origin, size, &sbox, why, why_size))
++      return -1;
++   /* the destination region is the source's size at the destination's origin */
++   unsigned dsize[3] = { size ? size[0] : (unsigned)sbox.width,
++                         size ? size[1] : (unsigned)sbox.height,
++                         size ? size[2] : (src->res->target == PIPE_TEXTURE_3D
++                                              ? (unsigned)sbox.depth : 1) };
++   if (src->res->target == PIPE_TEXTURE_1D || src->res->target == PIPE_TEXTURE_1D_ARRAY)
++      dsize[1] = 1;
++   if (!texture_box(dst, dst_level, dst_layer, dst_origin, dsize, &dbox, why, why_size))
++      return -1;
++
++   struct pipe_context *pipe = device->pipe;
++   pipe->resource_copy_region(pipe, dst->res, dst_level, dbox.x, dbox.y, dbox.z, src->res,
++                              src_level, &sbox);
++   return blit_wait(device, "texture copy", why, why_size);
++}
++
++int
++rwa_buffer_copy(struct rwa_device *device, struct rwa_buffer *src, size_t src_offset,
++                struct rwa_buffer *dst, size_t dst_offset, size_t size, char *why,
++                size_t why_size)
++{
++   if (!device || !src || !dst) {
++      say(why, why_size, "a buffer copy with no %s",
++          !device ? "device" : !src ? "source buffer" : "destination buffer");
++      return -1;
++   }
++   if (src_offset > src->size || size > src->size - src_offset ||
++       dst_offset > dst->size || size > dst->size - dst_offset) {
++      say(why, why_size, "a copy of %zu bytes from offset %zu of a %zu-byte buffer to "
++                         "offset %zu of a %zu-byte one", size, src_offset, src->size,
++          dst_offset, dst->size);
++      return -1;
++   }
++   if (size == 0)
++      return 0;
++   /* Gallium forbids an overlapping copy within one resource, and so does Metal */
++   if (src == dst && src_offset < dst_offset + size && dst_offset < src_offset + size) {
++      say(why, why_size, "a copy of %zu bytes within one buffer from offset %zu to %zu, "
++                         "which overlap", size, src_offset, dst_offset);
++      return -1;
++   }
++
++   struct pipe_box box;
++   u_box_1d((int)src_offset, (int)size, &box);
++   device->pipe->resource_copy_region(device->pipe, dst->res, 0, (unsigned)dst_offset, 0, 0,
++                                      src->res, 0, &box);
++   return blit_wait(device, "buffer copy", why, why_size);
++}
++
++int
++rwa_texture_gen_mipmap(struct rwa_device *device, struct rwa_texture *texture, char *why,
++                       size_t why_size)
++{
++   if (!device || !texture) {
++      say(why, why_size, "a mipmap generation with no %s", !device ? "device" : "texture");
++      return -1;
++   }
++   struct pipe_resource *res = texture->res;
++   if (res->last_level == 0)
++      return 0;   /* one level: Metal's own answer is that there is nothing to make */
++   if (res->nr_samples > 1) {
++      say(why, why_size, "mipmaps for a %s of %u samples per texel, which has one level",
++          texture->format_name, res->nr_samples);
++      return -1;
++   }
++   /* Mesa's own helper, a linear blit level from level, every slice at once. It answers
++    * false only when the screen cannot sample and render the format. */
++   if (!util_gen_mipmap(device->pipe, res, res->format, 0, res->last_level, 0,
++                        res->target == PIPE_TEXTURE_3D ? 0 : texture->layers - 1,
++                        PIPE_TEX_FILTER_LINEAR)) {
++      say(why, why_size, "the GPU driver cannot both sample and render %s, which is what "
++                         "making its mipmaps takes", texture->format_name);
++      return -1;
++   }
++   return blit_wait(device, "mipmap generation", why, why_size);
++}
++
++int
++rwa_buffer_fill(struct rwa_device *device, struct rwa_buffer *buffer, size_t offset,
++                size_t size, unsigned char value, char *why, size_t why_size)
++{
++   if (!device || !buffer) {
++      say(why, why_size, "a buffer fill with no %s", !device ? "device" : "buffer");
++      return -1;
++   }
++   if (offset > buffer->size || size > buffer->size - offset) {
++      say(why, why_size, "a fill of %zu bytes at offset %zu of a %zu-byte buffer", size,
++          offset, buffer->size);
++      return -1;
++   }
++   if (size == 0)
++      return 0;
++
++   struct pipe_context *pipe = device->pipe;
++   if (pipe->clear_buffer) {
++      /* four bytes of the value when the range allows it, which is the width freedreno's
++       * engine fills at; one byte otherwise, which Gallium also defines */
++      uint32_t pattern = value * 0x01010101u;
++      int width = ((offset | size) & 3) == 0 ? 4 : 1;
++      pipe->clear_buffer(pipe, buffer->res, (unsigned)offset, (unsigned)size, &pattern,
++                         width);
++      return blit_wait(device, "buffer fill", why, why_size);
++   }
++   /* No GPU fill (softpipe): through the buffer's own mapping, after everything already
++    * queued has finished, so the bytes land after the work before them and not under it. */
++   int rc = finish_or_say_why(device, false, "work before a buffer fill", why, why_size);
++   if (rc != 0)
++      return rc;
++   memset((uint8_t *)buffer->map + offset, value, size);
++   return 0;
++}
+diff --git a/userland/src/redwoodmetal.m b/userland/src/redwoodmetal.m
+index dd44393..500feca 100644
+--- a/userland/src/redwoodmetal.m
++++ b/userland/src/redwoodmetal.m
+@@ -584,6 +584,16 @@
+ 	int (*fence_done)(struct rwa_device *, void *);   /* 0017; absent in older ones */
+ 	void (*discard_stats)(unsigned *, unsigned *);    /* 0020; absent in older ones */
+ 	int (*wait_fence)(struct rwa_device *, void *, char *, size_t);/* 0016; absent in older */
++	/* 0021: the blit encoder's GPU half; absent in older ones, and then -blitCommandEncoder
++	 * answers nil as it did before */
++	int (*texture_copy)(struct rwa_device *, struct rwa_texture *, unsigned, unsigned,
++			    const unsigned *, const unsigned *, struct rwa_texture *, unsigned,
++			    unsigned, const unsigned *, char *, size_t);
++	int (*buffer_copy)(struct rwa_device *, struct rwa_buffer *, size_t, struct rwa_buffer *,
++			   size_t, size_t, char *, size_t);
++	int (*texture_gen_mipmap)(struct rwa_device *, struct rwa_texture *, char *, size_t);
++	int (*buffer_fill)(struct rwa_device *, struct rwa_buffer *, size_t, size_t, unsigned char,
++			   char *, size_t);
+ } mesa;
+ 
+ /* Loaded once, and its absence is an answer rather than a crash: without the GPU there is
+@@ -662,6 +672,19 @@
+ 	 * sweetmetal_async=1 is ignored and says so */
+ 	*(void **)&mesa.fence_done = dlsym(mesa.handle, "rwa_fence_done");
+ 	*(void **)&mesa.discard_stats = dlsym(mesa.handle, "rwa_discard_stats");   /* 0020 */
++	/* 0021: all four or none -- a blit encoder that has some of its operations would
++	 * drop the others in the middle of a command buffer */
++	*(void **)&mesa.texture_copy = dlsym(mesa.handle, "rwa_texture_copy");
++	*(void **)&mesa.buffer_copy = dlsym(mesa.handle, "rwa_buffer_copy");
++	*(void **)&mesa.texture_gen_mipmap = dlsym(mesa.handle, "rwa_texture_gen_mipmap");
++	*(void **)&mesa.buffer_fill = dlsym(mesa.handle, "rwa_buffer_fill");
++	if (mesa.texture_copy == NULL || mesa.buffer_copy == NULL ||
++	    mesa.texture_gen_mipmap == NULL || mesa.buffer_fill == NULL) {
++		mesa.texture_copy = NULL;
++		mesa.buffer_copy = NULL;
++		mesa.texture_gen_mipmap = NULL;
++		mesa.buffer_fill = NULL;
++	}
+ 	if (mesa.device_open == NULL || mesa.compute_create == NULL || mesa.dispatch == NULL ||
+ 	    mesa.texture_create == NULL || mesa.sampler_create == NULL) {
+ 		/* rwa_dispatch's arguments changed when textures were added to the contract, so
+@@ -1053,6 +1076,12 @@ @interface RedwoodMetalComputeEncoder : _MTLCommandEncoder
+ - (instancetype)initWithRedwoodCommandBuffer:(RedwoodMetalCommandBuffer *)commandBuffer;
+ @end
+ 
++/* 0021: MTLBlitCommandEncoder. Records into the command buffer like the compute encoder;
++ * -commit runs the copies in order with everything else (-runBlit:). */
++@interface RedwoodMetalBlitEncoder : _MTLCommandEncoder
++- (instancetype)initWithRedwoodCommandBuffer:(RedwoodMetalCommandBuffer *)commandBuffer;
++@end
++
+ @interface RedwoodMetalRenderEncoder : _MTLCommandEncoder
+ - (instancetype)initWithRedwoodCommandBuffer:(RedwoodMetalCommandBuffer *)commandBuffer
+ 				  descriptor:(id)descriptor;
+@@ -1102,6 +1131,17 @@ - (unsigned)vertexElementCount;
+ - (unsigned)vertexElementAttribute:(unsigned)index;
+ @end
+ 
++/* 0021: what a blit work item is; RW_BLIT_NONE (zero, what -init leaves) is not a blit */
++enum {
++	RW_BLIT_NONE = 0,
++	RW_BLIT_TEX_TEX,   /* rwa_texture_copy */
++	RW_BLIT_BUF_BUF,   /* rwa_buffer_copy, or memcpy for a buffer not of the library */
++	RW_BLIT_TEX_BUF,   /* rwa_finish, then rwa_texture_read into the buffer's memory */
++	RW_BLIT_BUF_TEX,   /* rwa_finish, then rwa_texture_write out of it */
++	RW_BLIT_MIPMAP,    /* rwa_texture_gen_mipmap */
++	RW_BLIT_FILL,      /* rwa_buffer_fill, or memset for a buffer not of the library */
++};
++
+ @interface RedwoodMetalWork : NSObject {
+ @public
+ 	RedwoodMetalComputePipeline *pipeline;
+@@ -1158,6 +1198,15 @@ @interface RedwoodMetalWork : NSObject {
+ 	id samplers[RW_MAX_BUFFERS];
+ 	unsigned count, textureCount, samplerCount;
+ 	unsigned groups[3], size[3];
++	/* 0021: a blit, when blitOp is not RW_BLIT_NONE (neither pipeline is set then).
++	 * blitSrc/blitDst are the MTLTexture or MTLBuffer of each side and are owned like the
++	 * rest; the numbers are what the encoder was given, copied. */
++	unsigned blitOp;
++	id blitSrc, blitDst;
++	unsigned blitSrcLevel, blitSrcSlice, blitDstLevel, blitDstSlice;
++	unsigned blitSrcOrigin[3], blitSize[3], blitDstOrigin[3];
++	size_t blitSrcOffset, blitDstOffset, blitLength, blitBytesPerRow, blitBytesPerImage;
++	unsigned char blitValue;
+ 	/* set by -retainReferences: everything above that is an object is then owned */
+ 	BOOL retained;
+ }
+@@ -4899,6 +4948,8 @@ - (void)retainReferences
+ 	[depth retain];
+ 	[depthStencilState retain];
+ 	[indexBuffer retain];
++	[blitSrc retain];   /* 0021 */
++	[blitDst retain];
+ 	for (unsigned i = 0; i < 8; i++) {
+ 		[color[i] retain];
+ 	}
+@@ -4918,6 +4969,8 @@ - (void)dealloc
+ 		[depth release];
+ 		[depthStencilState release];
+ 		[indexBuffer release];
++		[blitSrc release];   /* 0021 */
++		[blitDst release];
+ 		for (unsigned i = 0; i < 8; i++) {
+ 			[color[i] release];
+ 		}
+@@ -5509,7 +5562,23 @@ - (id)parallelRenderCommandEncoderWithDescriptor:(id)descriptor
+ /* The rest of what MTLCommandBuffer requires of a driver. Each declines rather than being
+  * absent, for the reason the device's own 44 were answered: a missing selector aborts the
+  * caller, and these are the four that were still missing. */
+-- (id)blitCommandEncoder          { return nil; }
++/* 0021: nil still when the compiler library has no blit calls (older than 0021) */
++- (id)blitCommandEncoder
++{
++	if (mesa.texture_copy == NULL || [[_queue device] mesaDevice] == NULL) {
++		RW_ONCE("the compiler library has no blit calls (older than 0021), so "
++			"-blitCommandEncoder answers nil\n");
++		return nil;
++	}
++	return [[[RedwoodMetalBlitEncoder alloc] initWithRedwoodCommandBuffer:self]
++		   autorelease];
++}
++
++- (id)blitCommandEncoderWithDescriptor:(id)descriptor
++{
++	(void)descriptor;   /* 0021: only sample-buffer attachments live there; none here */
++	return [self blitCommandEncoder];
++}
+ - (id)resourceStateCommandEncoder { return nil; }
+ - (id)accelerationStructureCommandEncoder { return nil; }
+ - (void)encodeSignalEvent:(id)event value:(uint64_t)value { (void)event; (void)value; }
+@@ -5602,6 +5671,13 @@ - (void)commit
+ 		}
+ 	}
+ 	for (RedwoodMetalWork *work in _work) {
++		if (work->blitOp != RW_BLIT_NONE) {   /* 0021 */
++			queued = true;
++			if (![self runBlit:work why:why size:sizeof(why)]) {
++				goto done;
++			}
++			continue;
++		}
+ 		if (work->clearOnly) {
+ 			queued = true;
+ 			[self runClear:work why:why size:sizeof(why)];
+@@ -5979,6 +6055,232 @@ - (void)runClear:(RedwoodMetalWork *)work why:(char *)why size:(size_t)size
+ 	}
+ }
+ 
++/*
++ * 0021: one blit, in its place in the replay, under the library lock -commit holds
++ * (recursive, as -runClear: takes it). The GPU ones are queued like a clear and paid by the
++ * commit's one wait; the two between a texture and a buffer's memory are done by the
++ * processor, so everything queued before them is finished first, and the bytes move through
++ * the library's own row-by-row read and write. NO, with the buffer failed, on any refusal:
++ * a copy that did not happen must not read as a result.
++ */
++- (BOOL)runBlitRows:(RedwoodMetalWork *)work
++	    texture:(struct rwa_texture *)texture
++	     memory:(uint8_t *)memory
++	     length:(size_t)length
++	why:(char *)why size:(size_t)size
++{
++	BOOL toBuffer = work->blitOp == RW_BLIT_TEX_BUF;
++	unsigned level = toBuffer ? work->blitSrcLevel : work->blitDstLevel;
++	unsigned slice = toBuffer ? work->blitSrcSlice : work->blitDstSlice;
++	const unsigned *origin = toBuffer ? work->blitSrcOrigin : work->blitDstOrigin;
++	size_t offset = toBuffer ? work->blitDstOffset : work->blitSrcOffset;
++	size_t bpr = work->blitBytesPerRow, bpi = work->blitBytesPerImage;
++	unsigned w = work->blitSize[0], h = work->blitSize[1], d = work->blitSize[2];
++
++	if (w == 0 || h == 0 || d == 0) {
++		return YES;   /* Metal: an empty region copies nothing */
++	}
++	if (bpr == 0 || (d > 1 && bpi < (size_t)h * bpr)) {
++		snprintf(why, size, "a copy of %ux%ux%u texels with %zu bytes per row and %zu per "
++			 "image, which do not hold it", w, h, d, bpr, bpi);
++		return NO;
++	}
++	for (unsigned z = 0; z < d; z++) {
++		size_t at = offset + (size_t)z * bpi;
++		unsigned o[3] = { origin[0], origin[1], origin[2] + z };
++		unsigned full = h;   /* rows read or written straight from the buffer's memory */
++		int rc = 0;
++
++		if (at > length || length - at < (size_t)(h - 1) * bpr) {
++			snprintf(why, size, "image %u of the copy starts at byte %zu of a %zu-byte "
++				 "buffer and its %u rows of %zu bytes do not fit", z, at, length,
++				 h, bpr);
++			return NO;
++		}
++		/* Metal's last row need only hold its texels, not a whole bytesPerRow; the library
++		 * moves bytesPerRow-sized rows' worth of texels, so a short last row goes through a
++		 * row of our own and only what fits in the buffer is moved */
++		if (length - at < (size_t)h * bpr) {
++			full = h - 1;
++		}
++		if (full > 0) {
++			unsigned sz[3] = { w, full, 1 };
++			rc = toBuffer ? mesa.texture_read(texture, level, slice, o, sz, memory + at,
++							  bpr, why, size)
++				      : mesa.texture_write(texture, level, slice, o, sz, memory + at,
++							   bpr, why, size);
++		}
++		if (rc == 0 && full < h) {
++			size_t tail = length - at - (size_t)full * bpr;
++			uint8_t *row = calloc(1, bpr);
++			unsigned ro[3] = { o[0], o[1] + full, o[2] };
++			unsigned sz[3] = { w, 1, 1 };
++
++			if (row == NULL) {
++				snprintf(why, size, "no memory for one row of %zu bytes", bpr);
++				return NO;
++			}
++			if (toBuffer) {
++				rc = mesa.texture_read(texture, level, slice, ro, sz, row, bpr, why,
++						       size);
++				if (rc == 0) {
++					memcpy(memory + at + (size_t)full * bpr, row, tail);
++				}
++			} else {
++				memcpy(row, memory + at + (size_t)full * bpr, tail);
++				rc = mesa.texture_write(texture, level, slice, ro, sz, row, bpr, why,
++							size);
++			}
++			free(row);
++		}
++		if (rc != 0) {
++			return NO;
++		}
++	}
++	return YES;
++}
++
++- (BOOL)runBlit:(RedwoodMetalWork *)work why:(char *)why size:(size_t)size
++{
++	struct rwa_device *device = [[_queue device] mesaDevice];
++	struct rwa_texture *srcTexture = NULL, *dstTexture = NULL;
++	struct rwa_buffer *srcBuffer = NULL, *dstBuffer = NULL;
++	uint8_t *srcMemory = NULL, *dstMemory = NULL;
++	size_t srcLength = 0, dstLength = 0;
++	BOOL ok = YES;
++	int rc = 0;
++
++	why[0] = 0;
++	switch (work->blitOp) {
++	case RW_BLIT_TEX_TEX:
++	case RW_BLIT_TEX_BUF:
++	case RW_BLIT_MIPMAP:
++		srcTexture = [work->blitSrc mesaTexture];
++		break;
++	default:
++		srcBuffer = [work->blitSrc mesaBuffer];
++		srcMemory = [work->blitSrc contents];
++		srcLength = [work->blitSrc length];
++		break;
++	}
++	switch (work->blitOp) {
++	case RW_BLIT_TEX_TEX:
++	case RW_BLIT_BUF_TEX:
++		dstTexture = [work->blitDst mesaTexture];
++		break;
++	case RW_BLIT_BUF_BUF:
++	case RW_BLIT_TEX_BUF:
++		dstBuffer = [work->blitDst mesaBuffer];
++		dstMemory = [work->blitDst contents];
++		dstLength = [work->blitDst length];
++		break;
++	default:
++		break;
++	}
++
++	rw_lib_lock();   /* already held by -commit; recursive */
++	switch (work->blitOp) {
++	case RW_BLIT_TEX_TEX:
++		if (srcTexture == NULL || dstTexture == NULL) {
++			snprintf(why, size, "a texture copy whose %s texture did not come from the "
++				 "compiler library", srcTexture == NULL ? "source" : "destination");
++			ok = NO;
++			break;
++		}
++		rc = mesa.texture_copy(device, srcTexture, work->blitSrcLevel, work->blitSrcSlice,
++				       work->blitSrcOrigin, work->blitSize, dstTexture,
++				       work->blitDstLevel, work->blitDstSlice, work->blitDstOrigin,
++				       why, size);
++		ok = rc == 0;
++		break;
++	case RW_BLIT_BUF_BUF:
++		if (srcBuffer != NULL && dstBuffer != NULL) {
++			rc = mesa.buffer_copy(device, srcBuffer, work->blitSrcOffset, dstBuffer,
++					      work->blitDstOffset, work->blitLength, why, size);
++			ok = rc == 0;
++			break;
++		}
++		/* a buffer of the kernel path has memory and no library object: copied by the
++		 * processor once everything before it has finished */
++		if (srcMemory == NULL || dstMemory == NULL ||
++		    work->blitSrcOffset > srcLength ||
++		    work->blitLength > srcLength - work->blitSrcOffset ||
++		    work->blitDstOffset > dstLength ||
++		    work->blitLength > dstLength - work->blitDstOffset) {
++			snprintf(why, size, "a copy of %zu bytes from offset %zu of a %zu-byte "
++				 "buffer to offset %zu of a %zu-byte one", work->blitLength,
++				 work->blitSrcOffset, srcLength, work->blitDstOffset, dstLength);
++			ok = NO;
++			break;
++		}
++		rc = mesa.finish(device, why, size);
++		if (rc == 0) {
++			memmove(dstMemory + work->blitDstOffset, srcMemory + work->blitSrcOffset,
++				work->blitLength);
++		}
++		ok = rc == 0;
++		break;
++	case RW_BLIT_TEX_BUF:
++	case RW_BLIT_BUF_TEX: {
++		BOOL toBuffer = work->blitOp == RW_BLIT_TEX_BUF;
++		struct rwa_texture *texture = toBuffer ? srcTexture : dstTexture;
++		uint8_t *memory = toBuffer ? dstMemory : srcMemory;
++		size_t length = toBuffer ? dstLength : srcLength;
++
++		if (texture == NULL || memory == NULL) {
++			snprintf(why, size, "a copy between a texture and a buffer, one of which "
++				 "did not come from the compiler library");
++			ok = NO;
++			break;
++		}
++		/* the processor reads or writes next: whatever is queued before this copy --
++		 * a draw into the texture, a kernel writing the buffer -- is finished first */
++		rc = mesa.finish(device, why, size);
++		ok = rc == 0 && [self runBlitRows:work texture:texture memory:memory
++					   length:length why:why size:size];
++		break;
++	}
++	case RW_BLIT_MIPMAP:
++		if (srcTexture == NULL) {
++			snprintf(why, size, "mipmaps for a texture that did not come from the "
++				 "compiler library");
++			ok = NO;
++			break;
++		}
++		rc = mesa.texture_gen_mipmap(device, srcTexture, why, size);
++		ok = rc == 0;
++		break;
++	case RW_BLIT_FILL:
++		if (srcBuffer != NULL) {
++			rc = mesa.buffer_fill(device, srcBuffer, work->blitSrcOffset,
++					      work->blitLength, work->blitValue, why, size);
++			ok = rc == 0;
++			break;
++		}
++		if (srcMemory == NULL || work->blitSrcOffset > srcLength ||
++		    work->blitLength > srcLength - work->blitSrcOffset) {
++			snprintf(why, size, "a fill of %zu bytes at offset %zu of a %zu-byte buffer",
++				 work->blitLength, work->blitSrcOffset, srcLength);
++			ok = NO;
++			break;
++		}
++		rc = mesa.finish(device, why, size);
++		if (rc == 0) {
++			memset(srcMemory + work->blitSrcOffset, work->blitValue, work->blitLength);
++		}
++		ok = rc == 0;
++		break;
++	default:
++		break;
++	}
++	rw_lib_unlock();
++	if (!ok) {
++		rw_print("the blit failed: %s\n", why);
++		[self failWith:why];
++	}
++	return ok;
++}
++
+ - (void)failWith:(const char *)reason
+ {
+ 	_error = [[NSError errorWithDomain:@"RedwoodMetal" code:4
+@@ -8198,6 +8500,401 @@ - (void)endEncoding
+ 
+ @end
+ 
++/*
++ * 0021: MTLBlitCommandEncoder. It RECORDS, as the compute encoder does, and -commit runs
++ * what it recorded in order with the command buffer's other encoders (-runBlit:): a copy
++ * encoded after a draw reads what the draw wrote. Every object a blit names is owned by its
++ * work item from -recordWork: on (RedwoodMetalWork, 0005/0007).
++ *
++ * Everything <MTLBlitCommandEncoder> declares for iOS 16 is answered, as on the other two
++ * encoders, because a missing selector aborts the caller: what this driver does not do
++ * says so once and records nothing.
++ */
++@implementation RedwoodMetalBlitEncoder {
++	RedwoodMetalCommandBuffer *_commandBuffer;   /* not retained: it owns the encoder's life */
++}
++
++- (instancetype)initWithRedwoodCommandBuffer:(RedwoodMetalCommandBuffer *)commandBuffer
++{
++	/* the same initialiser the compute encoder sends to super */
++	self = [super initWithCommandBuffer:commandBuffer];
++	if (self == nil) {
++		return nil;
++	}
++	_commandBuffer = commandBuffer;
++	return self;
++}
++
++- (id)device { return [_commandBuffer device]; }
++
++/* what each side of a blit has to be for -runBlit: to send it what it sends */
++static BOOL
++rw_blit_is_texture(id object, const char *what)
++{
++	if ([object isKindOfClass:[RedwoodMetalTexture class]]) {
++		return YES;
++	}
++	rw_print("a blit's %s is %s, not a texture of this driver; the blit is dropped\n",
++		 what, object == nil ? "nil" : object_getClassName(object));
++	return NO;
++}
++
++static BOOL
++rw_blit_is_buffer(id object, const char *what)
++{
++	if ([object isKindOfClass:[RedwoodMetalBuffer class]]) {
++		return YES;
++	}
++	rw_print("a blit's %s is %s, not a buffer of this driver; the blit is dropped\n",
++		 what, object == nil ? "nil" : object_getClassName(object));
++	return NO;
++}
++
++- (void)redwoodRecord:(RedwoodMetalWork *)work
++{
++	[_commandBuffer recordWork:work];   /* retains blitSrc/blitDst */
++	[work release];
++}
++
++- (void)copyFromTexture:(id)sourceTexture
++	    sourceSlice:(NSUInteger)sourceSlice
++	    sourceLevel:(NSUInteger)sourceLevel
++	   sourceOrigin:(MTLOrigin)sourceOrigin
++	     sourceSize:(MTLSize)sourceSize
++	      toTexture:(id)destinationTexture
++       destinationSlice:(NSUInteger)destinationSlice
++       destinationLevel:(NSUInteger)destinationLevel
++      destinationOrigin:(MTLOrigin)destinationOrigin
++{
++	if (!rw_blit_is_texture(sourceTexture, "source") ||
++	    !rw_blit_is_texture(destinationTexture, "destination")) {
++		return;
++	}
++	if (sourceSize.width == 0 || sourceSize.height == 0 || sourceSize.depth == 0) {
++		return;   /* Metal: an empty region copies nothing */
++	}
++	RedwoodMetalWork *work = [[RedwoodMetalWork alloc] init];
++
++	work->blitOp = RW_BLIT_TEX_TEX;
++	work->blitSrc = sourceTexture;
++	work->blitDst = destinationTexture;
++	work->blitSrcSlice = (unsigned)sourceSlice;
++	work->blitSrcLevel = (unsigned)sourceLevel;
++	work->blitSrcOrigin[0] = (unsigned)sourceOrigin.x;
++	work->blitSrcOrigin[1] = (unsigned)sourceOrigin.y;
++	work->blitSrcOrigin[2] = (unsigned)sourceOrigin.z;
++	work->blitSize[0] = (unsigned)sourceSize.width;
++	work->blitSize[1] = (unsigned)sourceSize.height;
++	work->blitSize[2] = (unsigned)sourceSize.depth;
++	work->blitDstSlice = (unsigned)destinationSlice;
++	work->blitDstLevel = (unsigned)destinationLevel;
++	work->blitDstOrigin[0] = (unsigned)destinationOrigin.x;
++	work->blitDstOrigin[1] = (unsigned)destinationOrigin.y;
++	work->blitDstOrigin[2] = (unsigned)destinationOrigin.z;
++	[self redwoodRecord:work];
++}
++
++/* Metal's whole-texture and slice/level-range copies, as one region copy per slice and
++ * level: the dimensions of each are the source level's, which Metal requires the
++ * destination's to equal. */
++- (void)copyFromTexture:(id)sourceTexture
++	    sourceSlice:(NSUInteger)sourceSlice
++	    sourceLevel:(NSUInteger)sourceLevel
++	      toTexture:(id)destinationTexture
++       destinationSlice:(NSUInteger)destinationSlice
++       destinationLevel:(NSUInteger)destinationLevel
++	     sliceCount:(NSUInteger)sliceCount
++	     levelCount:(NSUInteger)levelCount
++{
++	if (!rw_blit_is_texture(sourceTexture, "source") ||
++	    !rw_blit_is_texture(destinationTexture, "destination")) {
++		return;
++	}
++	BOOL volume = [sourceTexture textureType] == MTLTextureType3D;
++
++	for (NSUInteger l = 0; l < levelCount; l++) {
++		NSUInteger level = sourceLevel + l;
++		MTLSize size = MTLSizeMake(MAX([sourceTexture width] >> level, 1u),
++					   MAX([sourceTexture height] >> level, 1u),
++					   volume ? MAX([sourceTexture depth] >> level, 1u) : 1);
++
++		for (NSUInteger s = 0; s < sliceCount; s++) {
++			[self copyFromTexture:sourceTexture sourceSlice:sourceSlice + s
++				  sourceLevel:level sourceOrigin:MTLOriginMake(0, 0, 0)
++				   sourceSize:size toTexture:destinationTexture
++			     destinationSlice:destinationSlice + s
++			     destinationLevel:destinationLevel + l
++			    destinationOrigin:MTLOriginMake(0, 0, 0)];
++		}
++	}
++}
++
++- (void)copyFromTexture:(id)sourceTexture toTexture:(id)destinationTexture
++{
++	if (!rw_blit_is_texture(sourceTexture, "source") ||
++	    !rw_blit_is_texture(destinationTexture, "destination")) {
++		return;
++	}
++	NSUInteger type = [sourceTexture textureType];
++	NSUInteger slices = [sourceTexture arrayLength];
++
++	if (slices == 0) {
++		slices = 1;
++	}
++	if (type == MTLTextureTypeCube || type == MTLTextureTypeCubeArray) {
++		slices *= 6;
++	}
++	NSUInteger levels = MIN([sourceTexture mipmapLevelCount],
++				[destinationTexture mipmapLevelCount]);
++
++	[self copyFromTexture:sourceTexture sourceSlice:0 sourceLevel:0
++		    toTexture:destinationTexture destinationSlice:0 destinationLevel:0
++		   sliceCount:slices levelCount:MAX(levels, 1u)];
++}
++
++- (void)copyFromBuffer:(id)sourceBuffer
++	  sourceOffset:(NSUInteger)sourceOffset
++	      toBuffer:(id)destinationBuffer
++     destinationOffset:(NSUInteger)destinationOffset
++		  size:(NSUInteger)size
++{
++	if (!rw_blit_is_buffer(sourceBuffer, "source") ||
++	    !rw_blit_is_buffer(destinationBuffer, "destination")) {
++		return;
++	}
++	RedwoodMetalWork *work = [[RedwoodMetalWork alloc] init];
++
++	work->blitOp = RW_BLIT_BUF_BUF;
++	work->blitSrc = sourceBuffer;
++	work->blitDst = destinationBuffer;
++	work->blitSrcOffset = (size_t)sourceOffset;
++	work->blitDstOffset = (size_t)destinationOffset;
++	work->blitLength = (size_t)size;
++	[self redwoodRecord:work];
++}
++
++- (void)copyFromTexture:(id)sourceTexture
++	    sourceSlice:(NSUInteger)sourceSlice
++	    sourceLevel:(NSUInteger)sourceLevel
++	   sourceOrigin:(MTLOrigin)sourceOrigin
++	     sourceSize:(MTLSize)sourceSize
++	       toBuffer:(id)destinationBuffer
++      destinationOffset:(NSUInteger)destinationOffset
++ destinationBytesPerRow:(NSUInteger)destinationBytesPerRow
++destinationBytesPerImage:(NSUInteger)destinationBytesPerImage
++{
++	if (!rw_blit_is_texture(sourceTexture, "source") ||
++	    !rw_blit_is_buffer(destinationBuffer, "destination")) {
++		return;
++	}
++	RedwoodMetalWork *work = [[RedwoodMetalWork alloc] init];
++
++	work->blitOp = RW_BLIT_TEX_BUF;
++	work->blitSrc = sourceTexture;
++	work->blitDst = destinationBuffer;
++	work->blitSrcSlice = (unsigned)sourceSlice;
++	work->blitSrcLevel = (unsigned)sourceLevel;
++	work->blitSrcOrigin[0] = (unsigned)sourceOrigin.x;
++	work->blitSrcOrigin[1] = (unsigned)sourceOrigin.y;
++	work->blitSrcOrigin[2] = (unsigned)sourceOrigin.z;
++	work->blitSize[0] = (unsigned)sourceSize.width;
++	work->blitSize[1] = (unsigned)sourceSize.height;
++	work->blitSize[2] = (unsigned)sourceSize.depth;
++	work->blitDstOffset = (size_t)destinationOffset;
++	work->blitBytesPerRow = (size_t)destinationBytesPerRow;
++	work->blitBytesPerImage = (size_t)destinationBytesPerImage;
++	[self redwoodRecord:work];
++}
++
++/* MTLBlitOption only changes anything for a depth/stencil or PVRTC texture, which the
++ * library's texel read refuses by name in any case; none is honoured, and a non-zero one
++ * says so. */
++- (void)copyFromTexture:(id)sourceTexture
++	    sourceSlice:(NSUInteger)sourceSlice
++	    sourceLevel:(NSUInteger)sourceLevel
++	   sourceOrigin:(MTLOrigin)sourceOrigin
++	     sourceSize:(MTLSize)sourceSize
++	       toBuffer:(id)destinationBuffer
++      destinationOffset:(NSUInteger)destinationOffset
++ destinationBytesPerRow:(NSUInteger)destinationBytesPerRow
++destinationBytesPerImage:(NSUInteger)destinationBytesPerImage
++		options:(NSUInteger)options
++{
++	if (options != 0) {
++		RW_ONCE("a blit option (%lu) is not implemented and is ignored\n",
++			(unsigned long)options);
++	}
++	[self copyFromTexture:sourceTexture sourceSlice:sourceSlice sourceLevel:sourceLevel
++		 sourceOrigin:sourceOrigin sourceSize:sourceSize toBuffer:destinationBuffer
++	    destinationOffset:destinationOffset destinationBytesPerRow:destinationBytesPerRow
++       destinationBytesPerImage:destinationBytesPerImage];
++}
++
++- (void)copyFromBuffer:(id)sourceBuffer
++	  sourceOffset:(NSUInteger)sourceOffset
++     sourceBytesPerRow:(NSUInteger)sourceBytesPerRow
++   sourceBytesPerImage:(NSUInteger)sourceBytesPerImage
++	    sourceSize:(MTLSize)sourceSize
++	     toTexture:(id)destinationTexture
++      destinationSlice:(NSUInteger)destinationSlice
++      destinationLevel:(NSUInteger)destinationLevel
++     destinationOrigin:(MTLOrigin)destinationOrigin
++{
++	if (!rw_blit_is_buffer(sourceBuffer, "source") ||
++	    !rw_blit_is_texture(destinationTexture, "destination")) {
++		return;
++	}
++	RedwoodMetalWork *work = [[RedwoodMetalWork alloc] init];
++
++	work->blitOp = RW_BLIT_BUF_TEX;
++	work->blitSrc = sourceBuffer;
++	work->blitDst = destinationTexture;
++	work->blitSrcOffset = (size_t)sourceOffset;
++	work->blitBytesPerRow = (size_t)sourceBytesPerRow;
++	work->blitBytesPerImage = (size_t)sourceBytesPerImage;
++	work->blitSize[0] = (unsigned)sourceSize.width;
++	work->blitSize[1] = (unsigned)sourceSize.height;
++	work->blitSize[2] = (unsigned)sourceSize.depth;
++	work->blitDstSlice = (unsigned)destinationSlice;
++	work->blitDstLevel = (unsigned)destinationLevel;
++	work->blitDstOrigin[0] = (unsigned)destinationOrigin.x;
++	work->blitDstOrigin[1] = (unsigned)destinationOrigin.y;
++	work->blitDstOrigin[2] = (unsigned)destinationOrigin.z;
++	[self redwoodRecord:work];
++}
++
++- (void)copyFromBuffer:(id)sourceBuffer
++	  sourceOffset:(NSUInteger)sourceOffset
++     sourceBytesPerRow:(NSUInteger)sourceBytesPerRow
++   sourceBytesPerImage:(NSUInteger)sourceBytesPerImage
++	    sourceSize:(MTLSize)sourceSize
++	     toTexture:(id)destinationTexture
++      destinationSlice:(NSUInteger)destinationSlice
++      destinationLevel:(NSUInteger)destinationLevel
++     destinationOrigin:(MTLOrigin)destinationOrigin
++	       options:(NSUInteger)options
++{
++	if (options != 0) {
++		RW_ONCE("a blit option (%lu) is not implemented and is ignored\n",
++			(unsigned long)options);
++	}
++	[self copyFromBuffer:sourceBuffer sourceOffset:sourceOffset
++	   sourceBytesPerRow:sourceBytesPerRow sourceBytesPerImage:sourceBytesPerImage
++		  sourceSize:sourceSize toTexture:destinationTexture
++	    destinationSlice:destinationSlice destinationLevel:destinationLevel
++	   destinationOrigin:destinationOrigin];
++}
++
++- (void)generateMipmapsForTexture:(id)texture
++{
++	if (!rw_blit_is_texture(texture, "texture")) {
++		return;
++	}
++	RedwoodMetalWork *work = [[RedwoodMetalWork alloc] init];
++
++	work->blitOp = RW_BLIT_MIPMAP;
++	work->blitSrc = texture;
++	[self redwoodRecord:work];
++}
++
++- (void)fillBuffer:(id)buffer range:(NSRange)range value:(uint8_t)value
++{
++	if (!rw_blit_is_buffer(buffer, "buffer")) {
++		return;
++	}
++	RedwoodMetalWork *work = [[RedwoodMetalWork alloc] init];
++
++	work->blitOp = RW_BLIT_FILL;
++	work->blitSrc = buffer;
++	work->blitSrcOffset = (size_t)range.location;
++	work->blitLength = (size_t)range.length;
++	work->blitValue = value;
++	[self redwoodRecord:work];
++}
++
++/* Served by construction: every resource here is shared memory the processor and the GPU
++ * see alike, and every command runs in commit order, so there is nothing to synchronise,
++ * nothing to fence and no layout to optimise. */
++- (void)synchronizeResource:(id)resource { (void)resource; }
++- (void)synchronizeTexture:(id)texture slice:(NSUInteger)slice level:(NSUInteger)level
++{
++	(void)texture; (void)slice; (void)level;
++}
++- (void)optimizeContentsForGPUAccess:(id)texture { (void)texture; }
++- (void)optimizeContentsForGPUAccess:(id)texture slice:(NSUInteger)slice level:(NSUInteger)level
++{
++	(void)texture; (void)slice; (void)level;
++}
++- (void)optimizeContentsForCPUAccess:(id)texture { (void)texture; }
++- (void)optimizeContentsForCPUAccess:(id)texture slice:(NSUInteger)slice level:(NSUInteger)level
++{
++	(void)texture; (void)slice; (void)level;
++}
++- (void)updateFence:(id)fence  { (void)fence; }
++- (void)waitForFence:(id)fence { (void)fence; }
++- (void)sampleCountersInBuffer:(id)buffer
++		 atSampleIndex:(NSUInteger)index
++		   withBarrier:(BOOL)barrier
++{
++	(void)buffer; (void)index; (void)barrier;   /* the device has no counter sets */
++}
++
++/* Declined, and each says its name once. */
++- (void)resolveCounters:(id)sampleBuffer
++		inRange:(NSRange)range
++      destinationBuffer:(id)destinationBuffer
++      destinationOffset:(NSUInteger)destinationOffset
++{
++	(void)sampleBuffer; (void)range; (void)destinationBuffer; (void)destinationOffset;
++	RW_ONCE("counter sample buffers are not implemented; nothing is resolved\n");
++}
++- (void)getTextureAccessCounters:(id)texture
++			  region:(MTLRegion)region
++			mipLevel:(NSUInteger)mipLevel
++			   slice:(NSUInteger)slice
++		   resetCounters:(BOOL)resetCounters
++		  countersBuffer:(id)countersBuffer
++	    countersBufferOffset:(NSUInteger)countersBufferOffset
++{
++	(void)texture; (void)region; (void)mipLevel; (void)slice; (void)resetCounters;
++	(void)countersBuffer; (void)countersBufferOffset;
++	RW_ONCE("texture access counters (sparse textures) are not implemented\n");
++}
++- (void)resetTextureAccessCounters:(id)texture
++			    region:(MTLRegion)region
++			  mipLevel:(NSUInteger)mipLevel
++			     slice:(NSUInteger)slice
++{
++	(void)texture; (void)region; (void)mipLevel; (void)slice;
++	RW_ONCE("texture access counters (sparse textures) are not implemented\n");
++}
++- (void)resetCommandsInBuffer:(id)buffer withRange:(NSRange)range
++{
++	(void)buffer; (void)range;
++	RW_ONCE("indirect command buffers are not implemented; nothing is reset\n");
++}
++- (void)copyIndirectCommandBuffer:(id)source
++		      sourceRange:(NSRange)sourceRange
++		      destination:(id)destination
++		 destinationIndex:(NSUInteger)destinationIndex
++{
++	(void)source; (void)sourceRange; (void)destination; (void)destinationIndex;
++	RW_ONCE("indirect command buffers are not implemented; nothing is copied\n");
++}
++- (void)optimizeIndirectCommandBuffer:(id)buffer withRange:(NSRange)range
++{
++	(void)buffer; (void)range;
++}
++
++/* As on the compute encoder: the superclass retains the command buffer in the initialiser
++ * and gives it back only here. */
++- (void)endEncoding
++{
++	[super endEncoding];
++}
++
++@end
++
+ /*
+  * ---------------------------------------------------------------------------------------
+  * MTLArgumentEncoder, which on this driver is a RECORDER and not a writer.

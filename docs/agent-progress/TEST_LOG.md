@@ -615,3 +615,11 @@ Verdict 0175c: the uncached-source hypothesis is wrong (or not the main cost): r
 
 Verdict 0175d: bilinear's 29 ms is the blend arithmetic (6.4x nearest), not reads or the beam wait. Next: 0169, exact 1.5x as p, avg(p,q), q (2-4 ops a pixel).
 | 2026-11-21 | kernel 0165+0167+0168+0169 (CI 44918455560), 0174s flags + `sweetfb_filter=1`, `shim-boot-0175e.img` (`67e61b9b...`) | detached CI->image->`tools/sweet-boot-test.sh ... 0175e 720` (log `logs/boot-0175e.log`) | 1.5x linear filter at nearest's cost | "scaled copy filter bilinear"; **copy 3.36-4.53 ms** (median 3.37, 13 windows; nearest 4.5); 0 panics; phone left idle (best second 5 swaps): no smoothness or picture verdict | `logs/xnu-0175e.txt` |
+
+## Metal 0021 blit encoder + metaltest CA-quad descriptor fix, 0176m, 2026-11-21 (userdata flashed, RAM boot `shim-boot-0175e.img`)
+
+| Date | Build | Procedure | Expected | Actual | Artifacts |
+| --- | --- | --- | --- | --- | --- |
+| 2026-11-21 | metal 0017-0021 (`libredwoodair` `e35aa258...`, 4 new `rwa_*` exported), metaltest with attribute 4 (point_size float @40 = 1.0) in the CA-quad descriptor (`metaltest` `27904657...`), kernel 0169 image 0175e | detached `tools/metal-flash-test.sh work1.raw shim/out/shim-boot-0175e.img 0176m 720` (log `logs/flash-0176m.log`) | 12, 13 pass; 18, 19 build a pipeline | **19 passed, 2 failed**: 12 blit copy PASS, 13 mipmaps+tex2buf PASS; 18/19 pipeline now builds, draw gives every probe `000000ff` (= clear colour) | `logs/xnu-0176m.txt` |
+
+Verdict (one boot, `experimental`): blit encoder works for the test's cases (resource_copy_region, util_gen_mipmap, CPU tex->buf after finish). 18/19: `fixed_frag_lph_cph` is QuartzCore's uber-shader, configured entirely by function constants (`fc_color_inputs0`, `fc_color_opcodes0`, `fc_plane_count0`, ... -- `air2nir --ll`, scratch); undefined constants select 0 for each, so the expected vertex colours are not what that configuration draws. Black may be correct output; the test needs CA's real constants for a vertex-coloured quad.
