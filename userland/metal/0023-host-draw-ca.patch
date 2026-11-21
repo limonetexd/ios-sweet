@@ -1,0 +1,342 @@
+Subject: metal 0023: air_metal_test --draw-ca, metaltest 18/19's CA quad on the host (test only)
+
+Replays metaltest caQuad (QuartzCore vertex_layout_info[0]: stride 48, five attributes in
+buffer 1; vertices and UInt16 indices in one pool buffer at offsets 96 and 288; identity
+vertex buffers, six zeroed fragment buffers; BGRA8 64x64 cleared 404040ff) in four cases:
+(a) as metaltest, (b) non-indexed at offset 0, (c) indexed at offset 0, (d) vertex offset
+only. Prints six probe pixels and the count of pixels that differ from the clear.
+Softpipe cannot run QuartzCore's fixed_vert_*_spc or fixed_frag_lph_cph (f2f16, 8-bit
+scratch in nir_to_tgsi); std_vert0_lpf over metaltest's fs_color runs. No driver change.
+
+--- a/tools/mesa/air/air_metal_test.c
++++ b/tools/mesa/air/air_metal_test.c
+@@ -55,6 +55,7 @@
+  *                  [MTLPixelFormat[:MTLTextureType][,...]]]]
+  *   air_metal_test --draw-attrib VERTEXLIB VERTEXFUNCTION FRAGMENTLIB FRAGMENTFUNCTION
+  *                  [GATEDVERTEXFUNCTION]
++ *   air_metal_test --draw-ca VERTEXLIB VERTEXFUNCTION FRAGMENTLIB FRAGMENTFUNCTION
+  *   air_metal_test --attrib-sweep VERTEXLIB FRAGMENTLIB FRAGMENTFUNCTION
+  *   air_metal_test --argbufs FILE[.metallib|.bc] [FUNCTION]
+  *   air_metal_test --draw-argbuf SETMODULE DIRECTMODULE
+@@ -118,6 +119,7 @@
+ enum {
+    MTL_VF_UCHAR4_NORMALIZED = 9, MTL_VF_SHORT4_NORMALIZED = 24, MTL_VF_HALF2 = 25,
+    MTL_VF_UCHAR4_NORMALIZED_BGRA = 42,
++   MTL_VF_HALF4 = 27, MTL_VF_FLOAT = 28,
+    MTL_VF_FLOAT2 = 29, MTL_VF_FLOAT4 = 31, MTL_VF_INT4 = 35,
+    MTL_VF_UINT1010102_NORMALIZED = 41, MTL_VF_FLOAT_RGB9E5 = 55,
+    MTL_STEP_CONSTANT = 0, MTL_STEP_PER_VERTEX = 1, MTL_STEP_PER_INSTANCE = 2,
+@@ -6913,7 +6915,297 @@
+    printf("air_metal_test: deferred: %u check%s failed\n", failed, failed == 1 ? "" : "s");
+    return failed ? 1 : 0;
+ }
++
++/*
++ * --draw-ca: the on-device Metal self-test's "CA quad" (userland/metaltest/metaltest.m,
++ * caQuad) replayed on this host: QuartzCore's shaders, a 5-attribute vertex descriptor in
++ * buffer index 1, an indexed draw at buffer offsets. The question is only whether ANY
++ * fragment is written, per way of handing the same quad over.
++ *
++ *   air_metal_test --draw-ca VERTEXLIB VERTEXFUNCTION FRAGMENTLIB FRAGMENTFUNCTION
++ */
++#define CA_W 64
++#define CA_H 64
++#define CA_VOFF 96
++#define CA_STRIDE 48
++
++/* One 48-byte vertex of the quad, as metaltest's caQuad writes it. */
++static void
++ca_vertex(uint8_t *at, unsigned v)
++{
++   static const float pos[4][2] = { { -1, -1 }, { 1, -1 }, { -1, 1 }, { 1, 1 } };
++   static const uint16_t col[4][4] = { { 0x3c00, 0, 0, 0x3c00 }, { 0, 0x3c00, 0, 0x3c00 },
++                                       { 0, 0, 0x3c00, 0x3c00 },
++                                       { 0x3c00, 0x3c00, 0x3c00, 0x3c00 } };
++   float *f = (float *)(void *)at;
++   f[0] = pos[v][0];
++   f[1] = pos[v][1];
++   f[2] = 0;
++   f[3] = 1;
++   f[4] = f[6] = (pos[v][0] + 1) * 0.5f;
++   f[5] = f[7] = (1 - pos[v][1]) * 0.5f;
++   memcpy(at + 32, col[v], 8);
++   f[10] = 1.0f;   /* point_size */
++}
++
++static void
++ca_hex(const uint8_t *px, unsigned x, unsigned y, char out[12])
++{
++   const uint8_t *q = px + ((size_t)y * CA_W + x) * 4;
++   snprintf(out, 12, "%02x%02x%02x%02x", q[2], q[1], q[0], q[3]);   /* BGRA -> RGBA */
++}
++
++struct ca_case {
++   const char *what;
++   struct rwa_buffer *stream;
++   size_t stream_offset;
++   struct rwa_buffer *indices;   /* NULL: non-indexed */
++   size_t index_offset;
++   unsigned count;
++};
++
++static int
++run_draw_ca(const char *vpath, const char *vfunc, const char *fpath, const char *ffunc)
++{
++   struct metallib vlib = { 0 }, flib = { 0 };
++   char vname[256], fname[256];
++   const uint8_t *vbitcode = NULL, *fbitcode = NULL;
++   size_t vbitcode_size = 0, fbitcode_size = 0;
++
++   if (!load_metallib(vpath, &vlib) || !load_metallib(fpath, &flib))
++      return 1;
++   if (!find_function(&vlib, vfunc, vname, sizeof(vname), &vbitcode, &vbitcode_size))
++      return 1;
++   if (!find_function(&flib, ffunc, fname, sizeof(fname), &fbitcode, &fbitcode_size))
++      return 1;
++
++   setenv("RWA_SOFTWARE", "1", 0);
++
++   char why[WHY] = "";
++   struct rwa_device *device = rwa_device_open(why, sizeof(why));
++   if (!device) {
++      printf("air_metal_test: rwa_device_open: %s\n", why);
++      return 1;
++   }
++   printf("air_metal_test: --draw-ca %s over %s on \"%s\"\n", vname, fname,
++          rwa_device_name(device));
+ 
++   const struct rwa_texture_shape ts = {
++      .pixel_format = MTL_BGRA8_UNORM, .type = MTL_TEXTURE_TYPE_2D,
++      .width = CA_W, .height = CA_H, .depth = 1, .array_length = 1, .mip_levels = 1,
++      .sample_count = 1, .usage = MTL_USAGE_SHADER_READ | MTL_USAGE_RENDER_TARGET,
++   };
++   struct rwa_texture *target = rwa_texture_create(device, &ts, why, sizeof(why));
++   if (!target) {
++      printf("air_metal_test: rwa_texture_create (target): %s\n", why);
++      return 1;
++   }
++   struct rwa_texture *color[1] = { target };
++
++   /* QuartzCore's vertex_layout_info[0]: five attributes, all in buffer index 1. */
++   struct rwa_render_shape shape = { .color_count = 1, .sample_count = 1 };
++   shape.color_format[0] = MTL_BGRA8_UNORM;
++   static const unsigned fmts[5] = { MTL_VF_FLOAT4, MTL_VF_FLOAT2, MTL_VF_FLOAT2,
++                                     MTL_VF_HALF4, MTL_VF_FLOAT };
++   static const unsigned offs[5] = { 0, 16, 24, 32, 40 };
++   for (unsigned i = 0; i < 5; i++)
++      shape.vertex_attribute[i] = (struct rwa_vertex_attribute){
++         .format = fmts[i], .offset = offs[i], .buffer_index = 1 };
++   shape.vertex_layout[1] = (struct rwa_vertex_layout){
++      .stride = CA_STRIDE, .step_function = MTL_STEP_PER_VERTEX, .step_rate = 1 };
++
++   struct rwa_render_info info = { 0 };
++   struct rwa_render *pipe =
++      rwa_render_create(device, vbitcode, vbitcode_size, vfunc, fbitcode, fbitcode_size,
++                        ffunc, &shape, &info, why, sizeof(why));
++   if (!pipe) {
++      printf("air_metal_test: rwa_render_create: %s\n", why);
++      return 1;
++   }
++   printf("air_metal_test: pipeline: vertex_buffers %u, fragment_buffers %u, "
++          "fragment_textures %u, fragment_samplers %u, generated_vertex_stage %u, "
++          "fragment_writes_depth %u\n",
++          info.vertex_buffers, info.fragment_buffers, info.fragment_textures,
++          info.fragment_samplers, info.generated_vertex_stage,
++          info.fragment_writes_depth);
++   printf("air_metal_test: pipeline: %u vertex attributes:", info.vertex_attribute_count);
++   for (unsigned i = 0; i < info.vertex_attribute_count; i++)
++      printf(" [%u]=attribute(%u)", i, info.vertex_attribute_index[i]);
++   printf("; stream slots %u, stream mask 0x%x, vertex_argbuf_mask 0x%x, "
++          "fragment_argbuf_mask 0x%x, blend_enabled_mask 0x%x, color_write_masks 0x%x, "
++          "varyings_mode %u, depth_store_discarded %u\n",
++          info.vertex_streams, info.vertex_stream_mask, info.vertex_argbuf_mask,
++          info.fragment_argbuf_mask, info.blend_enabled_mask, info.color_write_masks,
++          info.varyings_mode, info.depth_store_discarded);
++
++   /* Data: the pool, the expanded and the plain vertex buffers, the index buffers. */
++   static const uint16_t idx[6] = { 0, 1, 2, 2, 1, 3 };
++   const size_t ioff = CA_VOFF + 4 * CA_STRIDE;
++   struct rwa_buffer *pool = rwa_buffer_create(device, 512, why, sizeof(why));
++   struct rwa_buffer *expanded = rwa_buffer_create(device, 6 * CA_STRIDE, why, sizeof(why));
++   struct rwa_buffer *plain = rwa_buffer_create(device, 4 * CA_STRIDE, why, sizeof(why));
++   struct rwa_buffer *idx_buf = rwa_buffer_create(device, sizeof(idx), why, sizeof(why));
++   if (!pool || !expanded || !plain || !idx_buf) {
++      printf("air_metal_test: rwa_buffer_create (data): %s\n", why);
++      return 1;
++   }
++   uint8_t *m = rwa_buffer_map(pool);
++   memset(m, 0, 512);
++   for (unsigned v = 0; v < 4; v++) {
++      ca_vertex(m + CA_VOFF + v * CA_STRIDE, v);
++      ca_vertex((uint8_t *)rwa_buffer_map(plain) + v * CA_STRIDE, v);
++   }
++   for (unsigned i = 0; i < 6; i++)
++      ca_vertex((uint8_t *)rwa_buffer_map(expanded) + i * CA_STRIDE, idx[i]);
++   memcpy(m + ioff, idx, sizeof(idx));
++   memcpy(rwa_buffer_map(idx_buf), idx, sizeof(idx));
++
++   /* Vertex buffer arguments: identity at every declared index but the stream's (1),
++    * which is NULL here as the device driver leaves stream slots out.
++    */
++   struct rwa_buffer *vbuffers[16] = { 0 };
++   unsigned nvbuf = info.vertex_buffers < COUNT_OF(vbuffers) ? info.vertex_buffers
++                                                             : (unsigned)COUNT_OF(vbuffers);
++   for (unsigned i = 0; i < nvbuf; i++) {
++      if (i == 1)
++         continue;
++      vbuffers[i] = rwa_buffer_create(device, 64, why, sizeof(why));
++      if (!vbuffers[i]) {
++         printf("air_metal_test: rwa_buffer_create (vertex buffer %u): %s\n", i, why);
++         return 1;
++      }
++      float *f = rwa_buffer_map(vbuffers[i]);
++      memset(f, 0, 64);
++      for (unsigned k = 0; k < 4; k++)
++         f[k * 4 + k] = 1.0f;
++   }
++
++   /* Fragment: six zeroed 256-byte buffers at 0..5, no textures, no samplers. */
++   struct rwa_buffer *fbuffers[6];
++   for (unsigned i = 0; i < 6; i++) {
++      fbuffers[i] = rwa_buffer_create(device, 256, why, sizeof(why));
++      if (!fbuffers[i]) {
++         printf("air_metal_test: rwa_buffer_create (fragment buffer %u): %s\n", i, why);
++         return 1;
++      }
++      memset(rwa_buffer_map(fbuffers[i]), 0, 256);
++   }
++
++   /* The retry's resources: a 4x4 opaque-white RGBA8 texture and a nearest sampler. */
++   struct rwa_texture *white = NULL;
++   struct rwa_sampler *sampler = NULL;
++   struct rwa_texture *ftex[16] = { 0 };
++   struct rwa_sampler *fsamp[16] = { 0 };
++   unsigned ntex = info.fragment_textures < COUNT_OF(ftex) ? info.fragment_textures
++                                                           : (unsigned)COUNT_OF(ftex);
++   unsigned nsamp = info.fragment_samplers < COUNT_OF(fsamp) ? info.fragment_samplers
++                                                             : (unsigned)COUNT_OF(fsamp);
++   if (ntex || nsamp) {
++      const struct rwa_texture_shape ws = {
++         .pixel_format = 70 /* MTLPixelFormatRGBA8Unorm */, .type = MTL_TEXTURE_TYPE_2D,
++         .width = 4, .height = 4, .depth = 1, .array_length = 1, .mip_levels = 1,
++         .sample_count = 1, .usage = MTL_USAGE_SHADER_READ,
++      };
++      white = rwa_texture_create(device, &ws, why, sizeof(why));
++      if (!white) {
++         printf("air_metal_test: rwa_texture_create (white): %s\n", why);
++         return 1;
++      }
++      static uint8_t texels[4 * 4 * 4];
++      memset(texels, 0xff, sizeof(texels));
++      const unsigned origin[3] = { 0, 0, 0 }, extent[3] = { 4, 4, 1 };
++      if (rwa_texture_write(white, 0, 0, origin, extent, texels, 0, why, sizeof(why)) != 0) {
++         printf("air_metal_test: rwa_texture_write (white): %s\n", why);
++         return 1;
++      }
++      const struct rwa_sampler_state ss = {
++         .address = { 0, 0, 0 }, .min_filter = 0, .mag_filter = 0, .mip_filter = 0,
++         .compare_function = 0, .max_anisotropy = 1, .normalized_coordinates = 1,
++         .lod_min = 0.0f, .lod_max = 65504.0f,
++      };
++      sampler = rwa_sampler_create(device, &ss, why, sizeof(why));
++      if (!sampler) {
++         printf("air_metal_test: rwa_sampler_create: %s\n", why);
++         return 1;
++      }
++      for (unsigned i = 0; i < ntex; i++)
++         ftex[i] = white;
++      for (unsigned i = 0; i < nsamp; i++)
++         fsamp[i] = sampler;
++   }
++
++   const struct ca_case cases[4] = {
++      { "(a) as metaltest: stream 1 = {pool, 96}; indices = {pool, 288}; 6 indices",
++        pool, CA_VOFF, pool, ioff, 6 },
++      { "(b) non-indexed, offset 0: 6 expanded vertices", expanded, 0, NULL, 0, 6 },
++      { "(c) indexed, offset 0: 4 vertices at 0, 6 indices at 0", plain, 0, idx_buf, 0, 6 },
++      { "(d) indexed, vertex offset 96 only: stream 1 = {pool, 96}; indices at 0",
++        pool, CA_VOFF, idx_buf, 0, 6 },
++   };
++   static const float clear[4] = { 0.25f, 0.25f, 0.25f, 1.0f };
++   static const unsigned probe[6][2] = { { 1, 62 }, { 62, 62 }, { 1, 1 }, { 62, 1 },
++                                         { 32, 31 }, { 31, 32 } };
++   static uint8_t px[CA_W * CA_H * 4];
++   int result = 0;
++
++   printf("air_metal_test: readback row 0 is the TOP row (clip y = +1); pixels are "
++          "RGBA hex, (x,y) in readback row order; clear is 404040ff\n");
++   for (unsigned c = 0; c < COUNT_OF(cases); c++) {
++      struct rwa_vertex_stream streams[2] = { { 0 }, { cases[c].stream,
++                                                       cases[c].stream_offset } };
++      struct rwa_draw d = {
++         .color = color, .color_count = 1, .clear_color = clear,
++         .vertex = { .buffers = vbuffers, .buffer_count = nvbuf },
++         .fragment = { .buffers = fbuffers, .buffer_count = 6 },
++         .primitive = 3,                /* MTLPrimitiveTypeTriangle */
++         .vertex_start = 0, .vertex_count = cases[c].count,
++         .index_buffer = cases[c].indices, .index_type = 0 /* UInt16 */,
++         .index_buffer_offset = cases[c].index_offset,
++         .vertex_streams = streams, .vertex_stream_count = 2,
++      };
++      printf("air_metal_test: %s\n", cases[c].what);
++      int rc = rwa_render_draw(pipe, &d, why, sizeof(why));
++      if (rc != 0 && (ntex || nsamp)) {
++         printf("air_metal_test:   rwa_render_draw: %s\n", why);
++         printf("air_metal_test:   retrying once with a 4x4 white texture and a nearest "
++                "sampler at each declared slot (%u, %u)\n", ntex, nsamp);
++         d.fragment.textures = ftex;
++         d.fragment.texture_count = ntex;
++         d.fragment.samplers = fsamp;
++         d.fragment.sampler_count = nsamp;
++         rc = rwa_render_draw(pipe, &d, why, sizeof(why));
++      }
++      if (rc != 0) {
++         printf("air_metal_test:   rwa_render_draw: %s\n", why);
++         result = 1;
++         continue;
++      }
++      const unsigned origin[3] = { 0, 0, 0 }, extent[3] = { CA_W, CA_H, 1 };
++      if (rwa_texture_read(target, 0, 0, origin, extent, px, 0, why, sizeof(why)) != 0) {
++         printf("air_metal_test:   rwa_texture_read: %s\n", why);
++         result = 1;
++         continue;
++      }
++      printf("air_metal_test:  ");
++      for (unsigned i = 0; i < COUNT_OF(probe); i++) {
++         char h[12];
++         ca_hex(px, probe[i][0], probe[i][1], h);
++         printf(" (%u,%u) %s", probe[i][0], probe[i][1], h);
++      }
++      printf("\n");
++      unsigned drawn = 0;
++      for (unsigned i = 0; i < CA_W * CA_H; i++) {
++         const uint8_t *q = px + (size_t)i * 4;   /* BGRA; the clear is symmetric */
++         drawn += !(q[0] == 0x40 && q[1] == 0x40 && q[2] == 0x40 && q[3] == 0xff);
++      }
++      if (drawn == 0)
++         printf("air_metal_test:   NOTHING DRAWN\n");
++      else
++         printf("air_metal_test:   drew %u of %u\n", drawn, CA_W * CA_H);
++   }
++   return result;
++}
++
+ int
+ main(int argc, char **argv)
+ {
+@@ -7115,6 +7407,15 @@
+                         argc > 6 ? argv[6] : NULL);
+    }
+ 
++   if (argc >= 2 && !strcmp(argv[1], "--draw-ca")) {
++      if (argc < 6) {
++         fprintf(stderr, "usage: air_metal_test --draw-ca VERTEXLIB VERTEXFUNCTION "
++                         "FRAGMENTLIB FRAGMENTFUNCTION\n");
++         return 2;
++      }
++      return run_draw_ca(argv[2], argv[3], argv[4], argv[5]);
++   }
++
+    if (argc >= 2 && !strcmp(argv[1], "--draw-vertex")) {
+       if (argc < 5) {
+          fprintf(stderr, "usage: air_metal_test --draw-vertex FILE.metallib VERTEXFUNCTION "
