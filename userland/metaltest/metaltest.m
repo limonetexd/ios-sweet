@@ -801,6 +801,12 @@ t17(void)
  * and the library takes every constant as zero either way, so the fallback is the plain
  * -newFunctionWithName:, and the line says which one was used (fc=empty / fc=none).
  * Fragment buffers 0-5 are bound zero-filled because the shader declares them.
+ *
+ * 22-24 split 18/19 (both draw nothing): the same data and indexed draw, but the fragment is
+ * metaltest's fs_color (fsName nil; buffer 0 = opaque magenta, no scratch, reads no varying)
+ * and every pixel must be magenta. 22 std_vert0_lpf (no scratch: the index/offset path on
+ * the device), 23 fixed_vert_lph_spc (scratch + f16 colour varying), 24 fixed_vert_lpf_spc
+ * (scratch, float varying).
  */
 #define QC_LIB "/System/Library/Frameworks/QuartzCore.framework/default.metallib"
 
@@ -834,8 +840,11 @@ caQuad(NSString *vsName, NSString *fsName)
 		return R_SKIP;
 	}
 	BOOL vc = NO, fc = NO;
+	if (!fsName && !g_binlib) {
+		return skip("no metaltest metallib (test 07)");
+	}
 	id<MTLFunction> vs = qcFunction(lib, vsName, &vc);
-	id<MTLFunction> fs = qcFunction(lib, fsName, &fc);
+	id<MTLFunction> fs = fsName ? qcFunction(lib, fsName, &fc) : [g_binlib newFunctionWithName:@"fs_color"];
 	if (!vs || !fs) {
 		return fail("function nil (vs %s, fs %s)", vs ? "ok" : "nil", fs ? "ok" : "nil");
 	}
@@ -875,7 +884,10 @@ caQuad(NSString *vsName, NSString *fsName)
 	id<MTLBuffer> tm = [g_dev newBufferWithBytes:ident length:64 options:MTLResourceStorageModeShared];
 	id<MTLBuffer> cm = [g_dev newBufferWithBytes:ident length:64 options:MTLResourceStorageModeShared];
 	id<MTLBuffer> zero = [g_dev newBufferWithLength:256 options:MTLResourceStorageModeShared];
-	if (!pool || !mvp || !tm || !cm || !zero) {
+	static const float magenta[4] = { 1, 0, 1, 1 };
+	id<MTLBuffer> mag = [g_dev newBufferWithBytes:magenta length:sizeof(magenta)
+					      options:MTLResourceStorageModeShared];
+	if (!pool || !mvp || !tm || !cm || !zero || !mag) {
 		return fail("buffer nil");
 	}
 	uint8_t *m = [pool contents];
@@ -909,6 +921,9 @@ caQuad(NSString *vsName, NSString *fsName)
 	for (NSUInteger i = 0; i <= 5; i++) {
 		[e setFragmentBuffer:zero offset:0 atIndex:i];
 	}
+	if (!fsName) {
+		[e setFragmentBuffer:mag offset:0 atIndex:0];
+	}
 	[e drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:6 indexType:MTLIndexTypeUInt16
 		indexBuffer:pool indexBufferOffset:IOFF];
 	[e endEncoding];
@@ -917,6 +932,30 @@ caQuad(NSString *vsName, NSString *fsName)
 	}
 	static uint8_t px[W * H * 4];
 	readTex(t, px, W, H);
+
+	if (!fsName) {
+		/* BGRA in memory; magenta = ff00ffff RGBA, tolerance 40 per channel */
+		static const uint8_t bgra[4] = { 255, 0, 255, 255 };
+		int hit = 0;
+		for (int i = 0; i < W * H; i++) {
+			BOOL m = YES;
+			for (int k = 0; k < 4; k++) {
+				int dd = (int)px[i * 4 + k] - (int)bgra[k];
+				m = m && dd > -40 && dd < 40;
+			}
+			hit += m;
+		}
+		char c0[12], c3[12], mid[12];
+		hexpx(px, 1, 62, c0, sizeof(c0));
+		hexpx(px, 62, 1, c3, sizeof(c3));
+		hexpx(px, 32, 31, mid, sizeof(mid));
+		if (hit != W * H) {
+			return fail("fc=%s magenta %d/%d c0 %s c3 %s mid %s", vc ? "empty" : "none", hit, W * H,
+				c0, c3, mid);
+		}
+		note("fc=%s magenta %d/%d", vc ? "empty" : "none", hit, W * H);
+		return R_PASS;
+	}
 
 	/* NDC (-1,-1) is the bottom-left pixel: v0 (1,62) red, v1 (62,62) green, v2 (1,1) blue,
 	 * v3 (62,1) white. The diagonal joins v1 and v2, the line y == x; (32,31) is in the
@@ -966,6 +1005,24 @@ static int
 t19(void)
 {
 	return caQuad(@"fixed_vert_lpf_spc", @"fixed_frag_lph_cph");
+}
+
+static int
+t22(void)
+{
+	return caQuad(@"std_vert0_lpf", nil);
+}
+
+static int
+t23(void)
+{
+	return caQuad(@"fixed_vert_lph_spc", nil);
+}
+
+static int
+t24(void)
+{
+	return caQuad(@"fixed_vert_lpf_spc", nil);
 }
 
 /*
@@ -1116,7 +1173,8 @@ main(int argc, char **argv)
 		{ "blit mipmaps+tex2buf", t13, 10 }, { "compute", t14, 10 }, { "iosurface texture", t15, 10 },
 		{ "100 passes", t16, 30 }, { "completion handler+GPU times", t17, 10 },
 		{ "CA quad lph", t18, 30 }, { "CA quad lpf", t19, 30 }, { "scissor rect", t20, 10 },
-		{ "64 draws, one commit", t21, 10 },
+		{ "64 draws, one commit", t21, 10 }, { "CA std_vert0_lpf + fs_color", t22, 30 },
+		{ "CA fixed_vert_lph_spc + fs_color", t23, 30 }, { "CA fixed_vert_lpf_spc + fs_color", t24, 30 },
 	};
 	int counts[3] = { 0, 0, 0 };
 	int tmo_in_row = 0;
