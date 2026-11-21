@@ -77,7 +77,7 @@ def node(name, props=(), children=()):
 GPU_POOL_SIZE = 0x10000000
 
 
-def build(seed=None, qemu=False, highmem=False, gpupool=False, scale2=False, wlan=False):
+def build(seed=None, qemu=False, highmem=False, gpupool=False, scale2=False, wlan=False, amp=False):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
     # Carve the panic log off the top so the kernel never allocates over it.
@@ -152,8 +152,10 @@ def build(seed=None, qemu=False, highmem=False, gpupool=False, scale2=False, wla
             ('compatible', cstr('qcom,kryo470') + cstr('ARM,v8')),
             ('reg', u32(core << 8)),  # actual MPIDR Aff1:Aff0, NOT logical ID
             ('cpu-id', u32(core)),   # descriptive: XNU assigns IDs by DT order
-            ('cluster-id', u32(0)),  # descriptive; see ml_parse_cpu_topology
-            ('cluster-type', u32(0)),  # homogeneous CLUSTER_TYPE_SMP, not AMP
+            # --amp (xnu 0166, MAX_CPU_CLUSTERS 2): cpu0-5 'E' cluster 0, cpu6-7 'P' cluster 1,
+            # read by ml_parse_cpu_topology as a number; without it one CLUSTER_TYPE_SMP cluster
+            ('cluster-id', u32(1 if amp and core >= 6 else 0)),
+            ('cluster-type', u32((ord('P') if core >= 6 else ord('E')) if amp else 0)),
             ('die-cluster-id', u32(0)),
             ('cluster-core-id', u32(core)),
             ('l2-cache-id', u32(core)),  # distinct per-core L2 nodes in live FDT
@@ -264,7 +266,7 @@ def build(seed=None, qemu=False, highmem=False, gpupool=False, scale2=False, wla
 
 if __name__ == '__main__':
     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv,
-                 gpupool='--gpupool' in sys.argv, scale2='--scale2' in sys.argv,
+                 gpupool='--gpupool' in sys.argv, scale2='--scale2' in sys.argv, amp='--amp' in sys.argv,
                  wlan='--wlan' in sys.argv)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)

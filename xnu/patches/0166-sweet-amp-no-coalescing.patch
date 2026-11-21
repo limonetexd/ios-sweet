@@ -1,0 +1,100 @@
+From: HakiOS
+Subject: [PATCH 0166] sweet: AMP scheduling (A76 = P, A55 = E) and no timer coalescing
+
+
+Profiles of 0172p/0172m: neither CoreAnimation's render thread (32 % running), SpringBoard's
+main thread (16 %) nor the GPU (40-60 % busy) is saturated, yet frames are 36 ms apart:
+latency, not throughput. The kernel scheduled all eight cores as one SMP cluster, so UI
+threads ran on Cortex-A55s as often as on the A76s.
+
+- SWEET.h __ARM_AMP__ 1, board_config MAX_CPU_CLUSTERS 2: sched_amp with an E pset (cpu0-5)
+  and a P pset (cpu6-7). The ADT must carry the cluster types (tools/mkadt.py --amp,
+  SWEET_AMP=1 in tools/sweet-gpu-image.sh); this kernel is not meant for the SMP ADT.
+- sched_amp spill/idle-steal/spill-steal thresholds -32 on SWEET (Apple's 3/1/1 kept UI bursts
+  queued on the two A76s: DC28088/ios-sweet 0248 and its NOTES 2026-11-11, ~30 -> ~45 fps
+  with -32 on this SoC). kern.sched_amp_* sysctls still change them.
+- Timer coalescing off at boot (mach_timer_coalescing_enabled); boot-arg sweet_coal=1
+  restores Apple's default.
+---
+diff --git a/osfmk/kern/sched_amp_common.c b/osfmk/kern/sched_amp_common.c
+index 3c0974a..a7f59fe 100644
+--- a/osfmk/kern/sched_amp_common.c
++++ b/osfmk/kern/sched_amp_common.c
+@@ -65,9 +65,20 @@ sched_amp_init(void)
+ }
+ 
+ /* Spill threshold load average is ncpus in pset + (sched_amp_spill_count/(1 << PSET_LOAD_FRACTIONAL_SHIFT) */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * 0166: two P cores only. With Apple's 3/1/1 the lagging P load average kept UI bursts queued on
++ * the two A76s while A55s idled (DC28088 2482: more missed frames); -32 makes the gate the run
++ * queue alone (their 2482 + live -32: ~30 -> ~45 frames a second). Still kern.sched_amp_* sysctls.
++ */
++int sched_amp_spill_count = -32;
++int sched_amp_idle_steal = -32;
++int sched_amp_spill_steal = -32;
++#else
+ int sched_amp_spill_count = 3;
+ int sched_amp_idle_steal = 1;
+ int sched_amp_spill_steal = 1;
++#endif
+ 
+ /*
+  * We see performance gains from doing immediate IPIs to P-cores to run
+diff --git a/osfmk/kern/timer_call.c b/osfmk/kern/timer_call.c
+index f8c8180..31da18c 100644
+--- a/osfmk/kern/timer_call.c
++++ b/osfmk/kern/timer_call.c
+@@ -265,6 +265,18 @@ timer_call_init(void)
+ {
+ 	timer_longterm_init();
+ 	timer_call_init_abstime();
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * 0166: no timer coalescing (DC28088 measured 1 ms sleeps waking ~19 ms late with it on this
++	 * SoC). Boot-arg sweet_coal=1 restores Apple's default; kern.timer_coalescing_enabled too.
++	 */
++	{
++		uint32_t coal = 0;
++
++		(void)PE_parse_boot_argn("sweet_coal", &coal, sizeof(coal));
++		mach_timer_coalescing_enabled = coal != 0;
++	}
++#endif
+ }
+ 
+ 
+diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+index b99c2f4..8c35b68 100644
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -25,6 +25,14 @@
+  */
+ #define SWEET_SMP_MAX_CPUS         8
+ 
++/*
++ * 0166: AMP (after DC28088/ios-sweet 0248). With MAX_CPU_CLUSTERS 2 and the ADT's cluster
++ * types, ml_parse_cpu_topology makes an E pset (cpu0-5) and a P pset (cpu6-7) and sched_amp
++ * puts user threads above utility QoS on the A76s, spilling to the A55s (spill thresholds:
++ * sched_amp_common.c, 0166).
++ */
++#define __ARM_AMP__               1
++
+ #define ARM_ARCH_TIMER
+ #define __ARM_ARCH__              8
+ #define __ARM_VMSA__              8
+diff --git a/pexpert/pexpert/arm64/board_config.h b/pexpert/pexpert/arm64/board_config.h
+index 88e524a..d55c930 100644
+--- a/pexpert/pexpert/arm64/board_config.h
++++ b/pexpert/pexpert/arm64/board_config.h
+@@ -102,7 +102,9 @@
+ 
+ #define MAX_L2_CLINE                   6
+ #define MAX_CPUS                       8
+-#define MAX_CPU_CLUSTERS               1
++/* 0166: two clusters (six Cortex-A55 = E, two Cortex-A76 = P) for XNU's sched_amp; the ADT must
++ * say so (tools/mkadt.py --amp): cpu0-5 cluster-type 'E', cpu6-7 'P' */
++#define MAX_CPU_CLUSTERS               2
+ 
+ #define CORE_NCTRS                     8 /* Placeholder; KPC is not enabled for this target */
+ 
