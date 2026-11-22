@@ -684,3 +684,11 @@ Verdict 0179s (one boot, real device, `experimental`): with the constants CA's c
 User, on the screen during 0180c: the About page is broken (new); the lines, missing icons/symbols/widgets, the rdar text and the missing wallpaper are unchanged; the first time a new animation appears it lags, then it runs normally.
 
 Verdict 0180c (real device, second boot of this root, `experimental`): 24/24 reproduces on a boot with no flash before it. Warm and stress runs still to do (boot B).
+
+## metaltest warm + stress (24/24 close, boot B), 0180s, 2026-11-22 (userdata flash, user typed "yes. always")
+
+| Date | Build | Procedure | Expected | Actual | Artifacts |
+| --- | --- | --- | --- | --- | --- |
+| 2026-11-22 | `aa6598a`: `metaltest` `342a7db9...` (`--runs N`); job `--delay --runs 20`; rest of the root as 0179s (`libredwoodair` `6bbda66d...`, `default.metallib` `34edf183...`, `RedwoodMetal` `049e0999...`); `shim-boot-0177f.img` (`d19dfd54...`) | `metal-build.sh payload`; `work1.raw` mounted, `sweet-metaltest-job.py --runs 20 --apply`, detached; product = sweet; `SWEET_SERIAL=f492cad9 tools/metal-flash-test.sh work1.raw shim/out/shim-boot-0177f.img 0180s 720` (flash 468 s, back in fastboot after 633 s, log pulled) | 20 passes of `done 24 passed` | every pass `done 23 passed 1 failed 0 skipped`: 06 "library from source" `FAIL timeout after 10 s` in all 20 passes; the other 23 pass in all 20 (17-24: 20/20 each; 18/19 the same corners; 21 commit 7.7-17.7 ms); `runs 20: 0 clean, 20 with fail/skip`; no panic | `logs/xnu-0180s.txt:1590-5021` |
+
+Verdict 0180s (real device, `not-working` for 24/24 under stress; the GPU tests themselves `experimental` 20/20): 06 compiles a source library through MTLCompilerService under a 10 s alarm. It is a margin, not a new fault: about 10 `SWEET FPS` seconds pass between 05 and 06 in 0179s (PASS, first boot after a flash) and in each 0180s pass (FAIL); in 0180c (second boot, no flash) 06 passes at once. Likely the compile is ~10 s with a cold compiler cache, and a timed-out compile (siglongjmp out of the call) is never cached, so every pass pays it again (inference, not checked). Not changed in this phase. Candidate fix: give 06 the 30 s the CA tests have, then repeat boot B.
