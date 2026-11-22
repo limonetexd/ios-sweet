@@ -48,7 +48,9 @@ Never write guessed Adreno register values, command packets, or firmware address
 
 The phone may hold the only copy of something. Back up before touching storage.
 
-Never flash or erase `boot`, `recovery`, `modem`, `persist`, `fsg`, `fsc`, `userdata`, `dtbo`, `vbmeta`, or GPT without explicit confirmation in the current session.
+Never flash or erase `boot`, `recovery`, `modem`, `persist`, `fsg`, `fsc`, `dtbo`, `vbmeta`, or GPT without explicit confirmation in the current session.
+
+Standing approval (user, 2026-11-22: "yes. always"): flashing `userdata` with a test root built from `work1.raw` through `tools/metal-flash-test.sh` needs no per-session confirmation, provided `fastboot getvar product` is `sweet`, a rollback image exists, and the rung is stated. Erasing `userdata`, or flashing it with anything else, still needs confirmation in the current session.
 
 Prefer `fastboot boot` over flashing. Verify codename and image hash first.
 
