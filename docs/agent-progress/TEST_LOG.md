@@ -674,3 +674,13 @@ Verdict (host, `experimental`): 18/19 test the wrong thing. With no constants Me
 | 2026-11-22 | metal 0017-0022 unchanged (`libredwoodair` `6bbda66d...`); `metaltest` `105052c4...` (18/19 set `fc_dest_index = 0` on the fragment); `shim-boot-0177f.img` (`d19dfd54...`) | user typed "yes"; `work1.raw` not attached; `fastboot getvar product` = sweet; `SWEET_SERIAL=f492cad9 tools/metal-flash-test.sh work1.raw shim/out/shim-boot-0177f.img 0179s 720` (userdata flash 468 s, back in fastboot after 633 s, log pulled) | 18/19 corners red/green/blue/white, clean diagonal, `fc=set` | 18 and 19 PASS `fc=set c0 f30606ff c1 00f906ff c2 0006f9ff c3 f3f9f9ff mid 048181ff/047e7eff`; `done 24 passed 0 failed 0 skipped` | `logs/xnu-0179s.txt:2378-2395` |
 
 Verdict 0179s (one boot, real device, `experimental`): with the constants CA's colour quad needs, QuartzCore's `fixed_frag_lph_cph` draws the interpolated vertex colours on ir3; first device evidence that the f16 colour varying (0006 widening) and an f16 colour output work. metaltest 24/24 for the first time. One boot only: not cold+warm+stress.
+
+## metaltest cold boot (24/24 close, boot A), 0180c, 2026-11-22 (RAM boot only, no flash)
+
+| Date | Build | Procedure | Expected | Actual | Artifacts |
+| --- | --- | --- | --- | --- | --- |
+| 2026-11-22 | root unchanged since 0179s (`libredwoodair` `6bbda66d...`, `metaltest` `105052c4...`); `shim-boot-0177f.img` (`d19dfd54...`) | `work1.raw` not attached; `fastboot devices` = f492cad9; `SWEET_SERIAL=f492cad9 bash tools/sweet-boot-test.sh shim/out/shim-boot-0177f.img 0180c 720` (fresh RAM boot from fastboot after 0179s' software reboot, not a power-off start; back in fastboot after 633 s, log pulled) | `done 24 passed 0 failed 0 skipped` | `done 24 passed 0 failed 0 skipped`; 18/19 the same corners as 0179s (`fc=set c0 f30606ff ... mid 048181ff/047e7eff`); 17 GPU times still 0 | `logs/xnu-0180c.txt:1584-1666` |
+
+User, on the screen during 0180c: the About page is broken (new); the lines, missing icons/symbols/widgets, the rdar text and the missing wallpaper are unchanged; the first time a new animation appears it lags, then it runs normally.
+
+Verdict 0180c (real device, second boot of this root, `experimental`): 24/24 reproduces on a boot with no flash before it. Warm and stress runs still to do (boot B).
