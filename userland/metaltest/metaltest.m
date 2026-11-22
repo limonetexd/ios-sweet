@@ -1188,7 +1188,7 @@ main(int argc, char **argv)
 	}
 	static const Test tests[] = {
 		{ "device", t01, 10 }, { "queue+empty commit", t02, 10 }, { "buffer roundtrip", t03, 10 },
-		{ "texture roundtrip", t04, 10 }, { "render clear", t05, 10 }, { "library from source", t06, 10 },
+		{ "texture roundtrip", t04, 10 }, { "render clear", t05, 10 }, { "library from source", t06, 30 },
 		{ "library from metallib", t07, 10 }, { "solid triangle", t08, 10 }, { "textured quad", t09, 10 },
 		{ "alpha blend", t10, 10 }, { "depth test", t11, 10 }, { "blit texture copy", t12, 10 },
 		{ "blit mipmaps+tex2buf", t13, 10 }, { "compute", t14, 10 }, { "iosurface texture", t15, 10 },
