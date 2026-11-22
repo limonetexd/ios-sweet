@@ -1,12 +1,14 @@
 /*
  * metaltest: headless Metal self-test for the Redwood plug-in. Foundation + Metal + IOSurface only.
  *
- *   metaltest [--delay] [PATH-TO-default.metallib]
+ *   metaltest [--delay] [--runs N] [PATH-TO-default.metallib]
  *
  * Every line goes to stdout, which launchd points at /dev/console, the same channel the plug-in's
  * rw_print() uses (redwoodmetal.m), so the lines reach the kernel log. Format:
  *   METALTEST: NN name: PASS [detail] | FAIL reason | SKIP reason
  *   METALTEST: done P passed F failed S skipped
+ * With --runs N (N > 1) the table runs N times: "METALTEST: pass K/N" before each pass, the done line
+ * after each, and "METALTEST: runs N: C clean, D with fail/skip" at the end. N == 1 prints none of these.
  * Each test runs under @try/@catch, a 10 s SIGALRM timeout and a crash-signal guard that
  * siglongjmp()s back to the runner. Exit status is always 0 (launchd must not respawn it).
  */
@@ -1167,9 +1169,19 @@ int
 main(int argc, char **argv)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0);
+	int nruns = 1;
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "--delay") == 0) {
 			sleep(20);
+		} else if (strcmp(argv[i], "--runs") == 0) {
+			char *end = NULL;
+			long n = (i + 1 < argc && argv[i + 1][0] != '\0') ? strtol(argv[i + 1], &end, 10) : 0;
+			if (i + 1 >= argc || n < 1 || n > 1000 || *end != '\0') {
+				say("bad --runs");
+				return 0;
+			}
+			nruns = (int)n;
+			i++;
 		} else {
 			g_libpath = argv[i];
 		}
@@ -1185,8 +1197,9 @@ main(int argc, char **argv)
 		{ "64 draws, one commit", t21, 10 }, { "CA std_vert0_lpf + fs_color", t22, 30 },
 		{ "CA fixed_vert_lph_spc + fs_color", t23, 30 }, { "CA fixed_vert_lpf_spc + fs_color", t24, 30 },
 	};
-	int counts[3] = { 0, 0, 0 };
-	int tmo_in_row = 0;
+	int counts[3];
+	int tmo_in_row;
+	int clean = 0, dirty = 0, passes_run = 0;
 	int ntests = (int)(sizeof(tests) / sizeof(tests[0]));
 	say("start, %d tests, pid %d, metallib %s", ntests, (int)getpid(), g_libpath);
 	signal(SIGALRM, on_signal);
@@ -1195,44 +1208,64 @@ main(int argc, char **argv)
 	signal(SIGABRT, on_signal);
 	signal(SIGILL, on_signal);
 	signal(SIGTRAP, on_signal);
-	for (int i = 0; i < ntests; i++) {
-		volatile int r = R_FAIL;
-		g_why[0] = g_note[0] = '\0';
-		g_sig = 0;
-		if (sigsetjmp(g_jmp, 1) == 0) {
-			alarm(tests[i].timeout);
-			@autoreleasepool {
-				@try {
-					r = tests[i].fn();
-				} @catch (NSException *ex) {
-					r = fail("exception %.40s: %.80s", [[ex name] UTF8String], [[ex reason] UTF8String]);
+	for (int k = 1; k <= nruns; k++) {
+		counts[R_PASS] = counts[R_FAIL] = counts[R_SKIP] = 0;
+		tmo_in_row = 0;
+		if (nruns > 1)
+			say("pass %d/%d", k, nruns);
+		passes_run++;
+		int gave_up = 0;
+		for (int i = 0; i < ntests; i++) {
+			volatile int r = R_FAIL;
+			g_why[0] = g_note[0] = '\0';
+			g_sig = 0;
+			if (sigsetjmp(g_jmp, 1) == 0) {
+				alarm(tests[i].timeout);
+				@autoreleasepool {
+					@try {
+						r = tests[i].fn();
+					} @catch (NSException *ex) {
+						r = fail("exception %.40s: %.80s", [[ex name] UTF8String], [[ex reason] UTF8String]);
+					}
+				}
+				alarm(0);
+				tmo_in_row = 0;
+			} else {
+				alarm(0);
+				if (g_sig == SIGALRM) {
+					r = fail("timeout after %u s", tests[i].timeout);
+					tmo_in_row++;
+				} else {
+					r = fail("crash: signal %d", (int)g_sig);
 				}
 			}
-			alarm(0);
-			tmo_in_row = 0;
-		} else {
-			alarm(0);
-			if (g_sig == SIGALRM) {
-				r = fail("timeout after %u s", tests[i].timeout);
-				tmo_in_row++;
+			counts[r]++;
+			if (r == R_PASS) {
+				say("%02d %s: PASS%s%s", i + 1, tests[i].name, g_note[0] ? " " : "", g_note);
+			} else if (r == R_SKIP) {
+				say("%02d %s: SKIP %s", i + 1, tests[i].name, g_why);
 			} else {
-				r = fail("crash: signal %d", (int)g_sig);
+				say("%02d %s: FAIL %s", i + 1, tests[i].name, g_why);
+			}
+			if (tmo_in_row >= 2) {
+				say("two timeouts in a row, giving up on the rest");
+				counts[R_SKIP] += ntests - i - 1;
+				gave_up = 1;
+				break;
 			}
 		}
-		counts[r]++;
-		if (r == R_PASS) {
-			say("%02d %s: PASS%s%s", i + 1, tests[i].name, g_note[0] ? " " : "", g_note);
-		} else if (r == R_SKIP) {
-			say("%02d %s: SKIP %s", i + 1, tests[i].name, g_why);
-		} else {
-			say("%02d %s: FAIL %s", i + 1, tests[i].name, g_why);
-		}
-		if (tmo_in_row >= 2) {
-			say("two timeouts in a row, giving up on the rest");
-			counts[R_SKIP] += ntests - i - 1;
+		say("done %d passed %d failed %d skipped", counts[R_PASS], counts[R_FAIL], counts[R_SKIP]);
+		if (counts[R_FAIL] == 0 && counts[R_SKIP] == 0)
+			clean++;
+		else
+			dirty++;
+		if (gave_up) {
+			if (nruns > 1)
+				say("pass %d gave up, stopping the remaining %d passes", k, nruns - k);
 			break;
 		}
 	}
-	say("done %d passed %d failed %d skipped", counts[R_PASS], counts[R_FAIL], counts[R_SKIP]);
+	if (nruns > 1)
+		say("runs %d: %d clean, %d with fail/skip", passes_run, clean, dirty);
 	return 0;
 }
