@@ -702,3 +702,11 @@ Verdict 0180s (real device, `not-working` for 24/24 under stress; the GPU tests 
 Verdict 0181s (real device, one boot, first boot after a flash): pass 1 is the run in a fresh boot, pass 2 the warm run, passes 1-20 the stress run; all clean. 06 was fast here, so this boot does not show whether 30 s was needed. The cold-compiler-cache explanation of 0180s is not supported: 0181s also follows a flash and compiled in ~2 s. Why 06 took ~10 s in 0179s and in every 0180s pass is unknown.
 
 24/24 status: cold boot (0180c, `metaltest` `105052c4`), warm + stress (0181s, `metaltest` `4f901701`) all pass with the same GPU stack (`libredwoodair` `6bbda66d`, `RedwoodMetal` `049e0999`, `shim-boot-0177f`). The harness differs between them, and the "cold boot" is a fresh RAM boot after a software reboot, not a power-off start.
+
+## metaltest fresh boot + warm + stress on one harness binary (boot C), 0182c, 2026-11-22 (RAM boot only, no flash)
+
+| Date | Build | Procedure | Expected | Actual | Artifacts |
+| --- | --- | --- | --- | --- | --- |
+| 2026-11-22 | root unchanged since 0181s (`5cf3dec`: `metaltest` `4f901701...`, job `--delay --runs 20`; `libredwoodair` `6bbda66d...`, `RedwoodMetal` `049e0999...`); `shim-boot-0177f.img` (`d19dfd54...`) | `work1.raw` not attached; product = sweet; `SWEET_SERIAL=f492cad9 bash tools/sweet-boot-test.sh shim/out/shim-boot-0177f.img 0182c 720` (fresh RAM boot from fastboot after 0181s' software reboot, not a power-off start; back in fastboot after 633 s, log pulled) | 20 passes of `done 24 passed` | all 20 passes `done 24 passed 0 failed 0 skipped`; `runs 20: 20 clean, 0 with fail/skip`; 06 PASS 20/20; 18 the same corners in all 20 (`fc=set c0 f30606ff ... mid 048181ff/047e7eff`); 17 GPU times still 0; only `panic` match is `exec DumpPanic` (also in 0181s) | `logs/xnu-0182c.txt:1595-2435` |
+
+Verdict 0182c (real device, `experimental`): with 0181s, the same `metaltest` binary (`4f901701`) and GPU stack pass 24/24 in a boot after a flash (0181s) and in a boot with no flash (0182c), 20 passes each. Cold (fresh boot), warm (pass 2) and stress (20 passes) now share one recorded commit. Not covered: a power-off cold start (needs the user), and test 17's zero GPU times.

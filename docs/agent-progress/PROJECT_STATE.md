@@ -33,5 +33,5 @@ Video (decoder, YUV compositing) needs its own audit and is `not-tested`.
 
 ## Handoff
 
-- Current phase and next step: `NEXT_PROMPT.md` (2026-11-21: keep 750x1624's smoothness at a better picture).
+- Current phase and next step: `NEXT_PROMPT.md` (2026-11-22: metaltest 24/24 closed, cold + warm + stress on `5cf3dec`, 0181s + 0182c; next phase to pick with the user).
 - **Risk (still true):** donor license unresolved (`ios-topaz` none detected, `hackios` NOASSERTION; `hakios-metal/` is MIT). `tools/xnu-tree.sh:44-45` runs `git reset --hard` and `clean -fdx` in its `XNU_TREE` target (default `~/cxnu`), so never point it at this repository.
