@@ -796,11 +796,16 @@ t17(void)
  * vertices carry four different opaque colours; a quad whose second triangle reads its
  * colour varying from the wrong registers splits along the diagonal.
  *
- * Function constants: an EMPTY MTLFunctionConstantValues is tried first; this driver's
- * -newFunctionWithName:constantValues: returns nil (redwoodmetal.m, Metal's nil compiler),
- * and the library takes every constant as zero either way, so the fallback is the plain
- * -newFunctionWithName:, and the line says which one was used (fc=empty / fc=none).
- * Fragment buffers 0-5 are bound zero-filled because the shader declares them.
+ * Function constants go through -newFunctionWithName:constantValues: (Apple's specializer,
+ * MTLCompilerService on the phone: 0178s said fc=empty), the plain -newFunctionWithName: only
+ * if that returns nil, and the line says which (fc=set / fc=none). The vertex functions get
+ * none: specialized empty they keep position and colour. The fragment gets fc_dest_index = 0:
+ * its colour outputs are guarded by the implicit predicate frg_has_color0 =
+ * (fc_generic && fc_attachment_count) || fc_dest_index == 0, so with NO constants set Metal
+ * removes every colour output and the pass writes nothing -- what 18/19 read before 0024
+ * (grey, 0178s). With fc_dest_index = 0 and the rest undefined, it returns the colour varying
+ * (host specializer, RESEARCH_LEDGER 2026-11-22). Fragment buffers 0-5 are bound zero-filled
+ * because the base shader declares them.
  *
  * 22-24 split 18/19 (both draw nothing): the same data and indexed draw, but the fragment is
  * metaltest's fs_color (fsName nil; buffer 0 = opaque magenta, no scratch, reads no varying)
@@ -811,10 +816,14 @@ t17(void)
 #define QC_LIB "/System/Library/Frameworks/QuartzCore.framework/default.metallib"
 
 static id<MTLFunction>
-qcFunction(id<MTLLibrary> lib, NSString *name, BOOL *viaConstants)
+qcFunction(id<MTLLibrary> lib, NSString *name, BOOL fragment, BOOL *viaConstants)
 {
 	NSError *e = nil;
 	MTLFunctionConstantValues *cv = [[MTLFunctionConstantValues alloc] init];
+	if (fragment) {
+		const uint8_t dest_index = 0;
+		[cv setConstantValue:&dest_index type:MTLDataTypeUChar withName:@"fc_dest_index"];
+	}
 	id<MTLFunction> f = [lib newFunctionWithName:name constantValues:cv error:&e];
 	*viaConstants = f != nil;
 	return f ? f : [lib newFunctionWithName:name];
@@ -843,8 +852,8 @@ caQuad(NSString *vsName, NSString *fsName)
 	if (!fsName && !g_binlib) {
 		return skip("no metaltest metallib (test 07)");
 	}
-	id<MTLFunction> vs = qcFunction(lib, vsName, &vc);
-	id<MTLFunction> fs = fsName ? qcFunction(lib, fsName, &fc) : [g_binlib newFunctionWithName:@"fs_color"];
+	id<MTLFunction> vs = qcFunction(lib, vsName, NO, &vc);
+	id<MTLFunction> fs = fsName ? qcFunction(lib, fsName, YES, &fc) : [g_binlib newFunctionWithName:@"fs_color"];
 	if (!vs || !fs) {
 		return fail("function nil (vs %s, fs %s)", vs ? "ok" : "nil", fs ? "ok" : "nil");
 	}
@@ -986,10 +995,10 @@ caQuad(NSString *vsName, NSString *fsName)
 	hexpx(px, 32, 31, ma, sizeof(ma));
 	hexpx(px, 31, 32, mb, sizeof(mb));
 	if (!ok) {
-		return fail("fc=%s c0 %s c1 %s c2 %s c3 %s mid %s/%s", vc && fc ? "empty" : "none", c[0], c[1],
+		return fail("fc=%s c0 %s c1 %s c2 %s c3 %s mid %s/%s", vc && fc ? "set" : "none", c[0], c[1],
 			c[2], c[3], ma, mb);
 	}
-	note("fc=%s c0 %s c1 %s c2 %s c3 %s mid %s/%s", vc && fc ? "empty" : "none", c[0], c[1], c[2], c[3],
+	note("fc=%s c0 %s c1 %s c2 %s c3 %s mid %s/%s", vc && fc ? "set" : "none", c[0], c[1], c[2], c[3],
 		ma, mb);
 	return R_PASS;
 }

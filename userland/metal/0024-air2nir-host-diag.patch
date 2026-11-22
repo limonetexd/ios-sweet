@@ -1,0 +1,121 @@
+Subject: metal 0024: air2nir host diagnostics (AIR_FC_UNDEF, AIR_EVAL_ZERO, AIR_EVAL_PRINT, AIR_EVAL_SCRATCH)
+
+Host only; air2nir is not part of the iOS build. All off unless the variable is set.
+  AIR_FC_UNDEF=1      pass no function constants (each undefined), as the device does with
+                      boot-arg sweetmetal_fc_undef=1 (0022)
+  AIR_EVAL_ZERO=1     --eval fills every buffer with zeros (metaltest's CA quad binds zeroed
+                      fragment buffers 0-5)
+  AIR_EVAL_PRINT=1    --eval prints the folded shader
+  AIR_EVAL_SCRATCH=1  --eval first turns scratch back into variables (nir_lower_scratch_to_var)
+                      and folds with algebra: control flow only, not IEEE-exact values
+Used 2026-11-22 to fold QuartzCore fixed_frag_lph_cph (RESEARCH_LEDGER, metaltest 18/19).
+
+--- a/tools/mesa/air/air2nir.c	2026-11-22 11:42:48
++++ b/tools/mesa/air/air2nir.c	2026-11-22 11:42:48
+@@ -36,6 +36,19 @@
+ #include "air_module.h"
+ #include "util/ralloc.h"
+ 
++/* host diagnostic AIR_FC_UNDEF=1: pass no function constants, so each is
++ * undefined (air.is_function_constant_defined false, value 0) -- what the
++ * device runtime does with boot-arg sweetmetal_fc_undef=1 (metal 0022) */
++static unsigned
++module_constants(void *ctx, const void *bitcode, size_t size, struct air_constant_value **fc)
++{
++   if (getenv("AIR_FC_UNDEF")) {
++      *fc = NULL;
++      return 0;
++   }
++   return air_module_function_constants(ctx, bitcode, size, fc);
++}
++
+ /* --library: translate an air.visible library function inside a generated
+  * entry point (nir_air.h). Off by default, because a wrapped function is not
+  * an entry point of the corpus and must not be counted as one.
+@@ -153,6 +166,8 @@
+ static uint8_t
+ pattern_byte(unsigned i)
+ {
++   if (getenv("AIR_EVAL_ZERO"))   /* host diagnostic: all-zero buffers */
++      return 0;
+    return library_wrapper ? library_byte(i) : (i * 7 + 13) & 0xff;
+ }
+ 
+@@ -301,7 +316,7 @@
+    void *ctx = ralloc_context(NULL);
+    const char *err = NULL;
+    struct air_constant_value *fc;
+-   unsigned num_fc = air_module_function_constants(ctx, mod->bitcode, mod->size, &fc);
++   unsigned num_fc = module_constants(ctx, mod->bitcode, mod->size, &fc);
+    struct air_to_nir_options options = { .constants = fc, .num_constants = num_fc,
+                                         .library_wrapper = library_wrapper };
+    struct air_shader_info info;
+@@ -336,6 +351,32 @@
+     * straight-line arithmetic behind one `if` -- and a shader with a branch
+     * could never be compared against LLVM, which has no such trouble.
+     */
++   /* host diagnostic AIR_EVAL_SCRATCH=1: turn constant-offset scratch back
++    * into variables first, so the folding below can follow the shader's
++    * private struct (a uber shader keeps its configuration there) */
++   if (getenv("AIR_EVAL_SCRATCH")) {
++      NIR_PASS(_, nir, nir_lower_scratch_to_var);
++      NIR_PASS(_, nir, nir_lower_indirect_derefs, nir_var_function_temp, UINT32_MAX);
++      /* the struct is written byte by byte (read-modify-write of 32-bit
++       * words): only algebra and undef folding see through that. Not IEEE-
++       * exact, so this mode is for control flow, not values */
++      bool p2;
++      unsigned r2 = 0;
++      do {
++         p2 = false;
++         NIR_PASS(p2, nir, nir_lower_vars_to_ssa);
++         NIR_PASS(p2, nir, nir_copy_prop);
++         NIR_PASS(p2, nir, nir_opt_undef);
++         NIR_PASS(p2, nir, nir_opt_constant_folding);
++         NIR_PASS(p2, nir, nir_opt_algebraic);
++         NIR_PASS(p2, nir, nir_opt_cse);
++         NIR_PASS(p2, nir, nir_opt_dce);
++         NIR_PASS(p2, nir, nir_opt_remove_phis);
++         NIR_PASS(p2, nir, nir_opt_dead_cf);
++         NIR_PASS(p2, nir, nir_opt_if, nir_opt_if_optimize_phi_true_false);
++      } while (p2 && ++r2 < 64);
++   }
++
+    bool progress;
+    unsigned rounds = 0;
+    do {
+@@ -348,6 +389,8 @@
+       NIR_PASS(progress, nir, nir_opt_if, nir_opt_if_optimize_phi_true_false);
+    } while (progress && ++rounds < 16);
+ 
++   if (getenv("AIR_EVAL_PRINT"))   /* host diagnostic: the folded shader */
++      nir_print_shader(nir, stdout);
+    printf("eval: the outputs this shader stores:\n");
+    unsigned printed = 0;
+    printed += print_buffer_stores(nir, &info);
+@@ -394,7 +437,7 @@
+    void *ctx = ralloc_context(NULL);
+    const char *err = NULL;
+    struct air_constant_value *fc;
+-   unsigned num_fc = air_module_function_constants(ctx, mod->bitcode, mod->size, &fc);
++   unsigned num_fc = module_constants(ctx, mod->bitcode, mod->size, &fc);
+    struct air_to_nir_options options = { .constants = fc, .num_constants = num_fc,
+                                         .library_wrapper = library_wrapper };
+    struct air_shader_info info;
+@@ -478,7 +521,7 @@
+     * a module that needs values is not a module the translator cannot handle.
+     */
+    struct air_constant_value *fc;
+-   unsigned num_fc = air_module_function_constants(ctx, mod->bitcode, mod->size, &fc);
++   unsigned num_fc = module_constants(ctx, mod->bitcode, mod->size, &fc);
+    struct air_to_nir_options options = { .constants = fc, .num_constants = num_fc,
+                                         .library_wrapper = library_wrapper };
+    if (num_fc)
+@@ -605,7 +648,7 @@
+          continue;
+       }
+       struct air_constant_value *fc;
+-      unsigned num_fc = air_module_function_constants(ctx, mods[k].bitcode, mods[k].size, &fc);
++      unsigned num_fc = module_constants(ctx, mods[k].bitcode, mods[k].size, &fc);
+       struct air_to_nir_options options = { .constants = fc, .num_constants = num_fc,
+                                         .library_wrapper = library_wrapper };
+       struct air_shader_info info;
