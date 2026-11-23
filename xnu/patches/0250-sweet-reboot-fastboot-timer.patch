@@ -1,0 +1,149 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 6f3f5d1..d181950 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,6 +111,7 @@ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_motion.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
++bsd/dev/sweet_reboot_timer.c		standard
+ bsd/dev/sweet_charger.c		standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_pmem.c			standard
+diff --git a/bsd/dev/sweet_reboot_timer.c b/bsd/dev/sweet_reboot_timer.c
+new file mode 100644
+index 0000000..c4fbe56
+--- /dev/null
++++ b/bsd/dev/sweet_reboot_timer.c
+@@ -0,0 +1,95 @@
++/*
++ * 0250: sweetgpu_reboot=SECONDS, back to fastboot after a test boot.
++ *
++ * tools/sweet-boot-test.sh and tools/metal-flash-test.sh RAM-boot an image and wait for the phone
++ * to come back to fastboot by itself. Same boot-arg and sequence as sg_reboot_fastboot() on branch
++ * gpu (redwood 0082); same PON spare / IMEM reason / PSCI path as DC28088 sweet_reboot.c (no PS_HOLD).
++ *
++ *   absent or N <= 20  nothing is created or written
++ *   N > 20             one kernel thread, started once the UFS root is up (bsd/dev/sweet_ufs.c),
++ *                      sleeps N s, then
++ *                        1. PM6150 SID 0 PON_SOFT_RB_SPARE 0x088f <- 0x02 << 1 (fastboot reason),
++ *                           through sweet_spmi_write() (bsd/dev/sweet_spmi.c allow-list);
++ *                        2. IMEM restart_reason 0x146aa65c <- 0x77665500 (SM7150 sram@146aa000);
++ *                        3. 12 s for the console ring to reach UFS (0069 flushes every 10 s), then
++ *                           PSCI SYSTEM_RESET.
++ * A failed PON write is logged and steps 2-3 run anyway (the IMEM reason alone may suffice); the
++ * write is issued once, never retried here.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <pexpert/pexpert.h>
++#include "sweet_spmi.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++void sweet_reboot_timer_start(void);
++
++#define SRT_PON_SID             0u
++#define SRT_PON_SOFT_RB_SPARE   0x088fu
++#define SRT_PON_FASTBOOT        (0x02u << 1)
++#define SRT_IMEM_RESTART_REASON 0x146aa65cu
++#define SRT_IMEM_FASTBOOT       0x77665500u
++#define SRT_PSCI_SYSTEM_RESET   0x84000009ull
++
++static int srt_seconds;
++static int srt_chan;
++
++static void
++srt_sleep(unsigned seconds)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(seconds, NSEC_PER_SEC, &deadline);
++	(void)assert_wait_deadline(&srt_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void __attribute__((noreturn))
++srt_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	printf("SWEET REBOOT: back to fastboot in %d s\n", srt_seconds);
++	srt_sleep((unsigned)srt_seconds);
++	/*
++	 * SweetBattery::start() normally initialised SPMI long before (N > 20 s; sweet_charger.c
++	 * waits 30 s the same way). sweet_spmi_init() only maps the arbiter and reads its version,
++	 * and after its first call it returns the cached result, so calling it here is harmless and
++	 * covers a boot where SweetBattery did not start. If it failed, sweet_spmi_write() returns
++	 * ENXIO and that is the rc logged below.
++	 */
++	(void)sweet_spmi_init();
++	int rc = sweet_spmi_write(SRT_PON_SID, SRT_PON_SOFT_RB_SPARE, SRT_PON_FASTBOOT);
++	vm_offset_t imem = ml_io_map(SRT_IMEM_RESTART_REASON & ~0xfffu, 0x1000);
++	if (imem) {
++		__asm__ volatile("dmb oshst" ::: "memory");
++		*(volatile uint32_t *)(imem + (SRT_IMEM_RESTART_REASON & 0xfffu)) = SRT_IMEM_FASTBOOT;
++		__asm__ volatile("dsb osh" ::: "memory");
++	}
++	printf("SWEET REBOOT: rebooting to fastboot (pon rc %d)\n", rc);
++	srt_sleep(12);    /* the console ring is flushed to UFS every 10 s (patch 0069) */
++	register uint64_t x0 __asm__("x0") = SRT_PSCI_SYSTEM_RESET;
++	__asm__ volatile("smc #0" : "+r"(x0) : : "x1", "x2", "x3", "memory");
++	for (;;) {
++		__asm__ volatile("wfe");
++	}
++}
++
++void
++sweet_reboot_timer_start(void)
++{
++	static bool started;
++	int seconds = 0;
++	(void)PE_parse_boot_argn("sweetgpu_reboot", &seconds, sizeof(seconds));
++	if (seconds <= 20 || started) {
++		return;
++	}
++	started = true;
++	srt_seconds = seconds;
++	thread_t th;
++	if (kernel_thread_start(srt_thread, NULL, &th) == KERN_SUCCESS) {
++		thread_deallocate(th);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index d84c85d..c920350 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -143,7 +143,10 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ int
+ sweet_spmi_write(unsigned sid, unsigned addr, uint8_t val)
+ {
+-	static const uint16_t allowed[] = {0x1042, 0x1061, 0x1340, 0x1342, 0x1365, 0x1366, 0x1370, 0x1643};
++	/* 0250: + PM6150 PON_SOFT_RB_SPARE 0x088f, the fastboot reason written once right before PSCI
++	 * SYSTEM_RESET at the end of a test boot (sweetgpu_reboot=N, bsd/dev/sweet_reboot_timer.c). */
++	static const uint16_t allowed[] = {0x1042, 0x1061, 0x1340, 0x1342, 0x1365, 0x1366, 0x1370, 0x1643,
++	    0x088f};
+ 	bool listed = false;
+ 	for (unsigned i = 0; i < sizeof(allowed) / sizeof(allowed[0]); i++) {
+ 		listed |= allowed[i] == addr;
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index caaf897..a64d9b3 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -50,6 +50,7 @@ extern void thread_deallocate(thread_t);
+ extern int hz;
+ static void sweet_log_start(void);
+ extern void sweet_sample_start(void);
++extern void sweet_reboot_timer_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_pmem_init(void);
+ extern void sweet_motion_init(void);
+@@ -669,6 +670,7 @@ sweet_ufs_init(void)
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
+ 	sweet_log_start();
+ 	sweet_sample_start();
++	sweet_reboot_timer_start();   /* sweetgpu_reboot=N (> 20): back to fastboot N s from here (0250) */
+ 	(void)sweet_native_adreno_reserve_pool();   /* owned-BO pool while memory is unfragmented (0147) */
+ 	sweet_pmem_init();       /* /dev/pmem (sweetpmem=1): bsd/dev/sweet_pmem.c, from ios-flame 0094 */
+ 	sweet_motion_init();     /* 0237 (sunfish 0229 / redfin 0972): /dev/redwood-motion, samples from wland's SEE client */

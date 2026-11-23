@@ -43,10 +43,17 @@ unless marked). Nothing here is measured on our phone. Labels follow `CLAUDE.md`
    only `sg_reboot_fastboot` (PMIC PON soft-reboot reason + IMEM restart reason + PSCI reset, already proven on
    our phone) as a standalone boot-arg patch 0250. Kernel code: `opus-impl` + `reviewer`.
 2. **Root.** Their userspace (native-legacy SweetMetal2.bundle + libSweetNativeBackend, wland, audio, BT, SSH)
-   must be built by their workflows (`native-metal.yml`, `wifi-0239.yml`, `audio.yml`, `bt.yml`, `ssh.yml`) and
-   installed into a copy of `work1.raw`; the iOS 16 root is the same 16.7.16 (20H392).
-3. **ADT + firmware.** Their `tools/mkadt.py` embeds Adreno/WLAN/ADSP firmware pulled read-only from the phone
-   (`tools/pull-sweet-firmware.py`); git-ignored, never committed.
+   must be built (their workflows: `native-metal.yml`, `wifi-0239.yml`, `audio.yml`, `bt.yml`, `ssh.yml`) and
+   installed into a copy of `work1.raw`; the iOS 16 root is the same 16.7.16 (20H392). GitHub refuses
+   `workflow_dispatch` for workflows absent from the default branch (`main` has only `xnu.yml`, `userland.yml`), so
+   either they go onto `main` (user's call) or they are built on the Mac: `build-sweet-native-metal.py` needs
+   Homebrew `bison`/`flex` first in `PATH` (Apple's bison 2.3 rejects `%code` in `ir3_parser.y`).
+3. **ADT + firmware.** Their `tools/mkadt.py` + `tools/adt-*.py` + `tools/sweet-adreno-firmware.py` +
+   `tools/mkpayload.py`. GPU firmware is already local (`research/gpu-sweet/fw/`, git-ignored); ADSP/WLAN/modem/
+   haptic firmware needs `tools/pull-sweet-firmware.py` from recovery (read-only). Their packaging scripts
+   (`scripts/package-*.py`) and so the full iOS 16 cmdline are **not in git**: notes give only the additions
+   (2482 = 0242's + `sweetfbflip=1 sweetfbgpu=1 sweetbuild=2482`; 0242 extras `sweetpanelvci=0 sweetmotion=0xbf`).
+   Ask the authors for the package script, or rebuild the cmdline from the kernel's boot-arg defaults.
 4. **Kernel build.** `xnu.yml` (dispatch on `gpu-dana`). Host rung only until steps 1-3 exist.
 
 ## 5. First experiments once it boots (one change per boot)
@@ -54,4 +61,8 @@ unless marked). Nothing here is measured on our phone. Labels follow `CLAUDE.md`
 1. Their best iOS 16 config as is (image 2482 cmdline: `sweetfbflip=1 sweetfbgpu=1 ...`): baseline on our phone.
 2. `metaltest --runs 20` on their stack: correctness evidence they do not have.
 3. The user's low-res trick on their present path: `sweetfb_mode=3` (750x1624) + `kern.sweet_fb_gpucopy=2`
-   (bilinear GPU copy). Boot-args only, no code, if 0246 scales from that canvas (to check in 0246 first).
+   (bilinear GPU copy). Read in source (host): `AppleCLCD::gpuCopy()` blits the whole client surface
+   (`s->width` x `s->height`, any size up to 0x7fff) into the panel back buffer with `BLIT_OP_SCALE`, filter
+   bilinear when `kern.sweet_fb_gpucopy=2`; it runs only for full-frame updates. So this is configuration, not
+   code, unless mode 3 changes the destination rectangle (check on the device). Their notes: mode 3 also needs a
+   MobileGestalt cache reset or the UI is oversized (`dana/main:NOTES.md` 1499).
