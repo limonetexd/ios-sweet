@@ -46,3 +46,9 @@ Fidelity is the real device unless stated. Commit = the kernel/image the observa
 | Battery / fuel gauge | experimental | SDAM 58 % / 4031 mV on a different image (`notes/agents/INDEX.md:32-36`); roadmap C4 TODO | n/a |
 | TSENS thermal log | partially-working | NOTES:214 (44–59.8 °C) | 0143 |
 | Audio, Bluetooth, camera, sensors, GPS, cellular, SEP | not-tested | README lists them absent; deferred by `CLAUDE.md` priority order or unbuilt here | n/a |
+
+## Branch `gpu-dana` (2026-11-23, merge `4e8b5cf`)
+
+Every feature of the DC28088/Dana stack (README table: Metal UI, Wi-Fi, Bluetooth, speaker audio, haptics, battery,
+calls, sensors, sleep, page flip, GPU present copy, USB SSH) is `not-tested` on our phone: the only evidence is their
+own log. `metaltest` on this tree: host build only (byte-identical to the 24/24 binary). Nothing booted.
