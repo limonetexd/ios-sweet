@@ -4,7 +4,7 @@ Durable rules for this repository. Read once per session. Do not restate them.
 
 ## Project
 
-Experimental Apple iOS 16.7.16 userland + XNU (`xnu-8796`) on a Xiaomi Redmi Note 10 Pro — `sweet`, SM7150 / Snapdragon 732G, Adreno 618. The tree is the user's own repository: `origin` = `limonetexd/ios-sweet-gpu` (CI runs there). Lineage: base port `dipa-studio/ios-sweet`; `DC28088/ios-sweet` is a public fork of it, used as a source (Wi-Fi/battery branch). Never re-fork, re-clone over it, reset it, or replace it.
+Experimental Apple iOS 16.7.16 userland + XNU (`xnu-8796`) on a Xiaomi Redmi Note 10 Pro — `sweet`, SM7150 / Snapdragon 732G, Adreno 618. The tree is the user's own repository: `origin` = `limonetexd/ios-sweet` (renamed from `ios-sweet-gpu` on 2026-11-23; CI runs there). Lineage: base port `dipa-studio/ios-sweet`; `DC28088/ios-sweet` is a public fork of it, and `DanaTheScripterAlt/ios-sweet` a fork of that (remotes `dipa`, `dc28088`, `dana`). Branches: `gpu` = the redwood Metal line (known-good tag `gpu-known-good-2026-11-23`); `gpu-dana` = Dana's tree (their kernel, shim, userspace unchanged) merged with `gpu` history plus `metaltest` and these rules (`CREDITS.md`, `docs/agent-progress/UPSTREAM_MERGE-2026-11-23.md` on that branch). Never re-fork, re-clone over it, reset it, or replace it.
 
 Hardware as documented upstream on 2026-11-06 — verify against the local tree: WCN3990 Wi-Fi/BT, Goodix GT9896 touch, PM6150/PM6150L PMIC, UFS root inside `userdata`, 1080×2400 panel presented as iPhone X (`iPhone10,3`).
 
