@@ -1,3 +1,10 @@
+> **Branch `gpu-dana`** of [limonetexd/ios-sweet](https://github.com/limonetexd/ios-sweet): the hardware and native-Metal
+> work of [DC28088/ios-sweet](https://github.com/DC28088/ios-sweet) and [DanaTheScripterAlt/ios-sweet](https://github.com/DanaTheScripterAlt/ios-sweet),
+> merged with history into the `gpu` line (RedwoodMetal, `metaltest`, frame-rate research). Kernel, shim and userspace
+> below are theirs, unchanged. Who did what, and the license status: [CREDITS.md](CREDITS.md). The redwood path stays on
+> branch `gpu` (tag `gpu-known-good-2026-11-23`). On our own phone this branch is **not tested** yet: the table below is
+> the upstream authors' result.
+
 # ios-sweet
 
 **Apple's iOS 16 running on a Redmi Note 10 Pro.**

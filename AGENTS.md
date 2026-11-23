@@ -1,9 +1,11 @@
 # Working on ios-sweet
 
-- Read `NOTES.md` before starting; it contains the project goal, hardware facts,
-  current blocker, local artifact locations and the next concrete action.
-- The user switches agents frequently. Update the active handoff in `NOTES.md`
-  after each milestone and before stopping. Record commits, CI run IDs, exact
+- Read `CLAUDE.md` first, then `docs/agent-progress/PROJECT_STATE.md` and
+  `docs/agent-progress/NEXT_PROMPT.md` (the next concrete action). `NOTES.md` is the
+  detailed running log: project goal, hardware facts, artifact locations.
+- The user switches agents frequently. After each milestone and before stopping,
+  add the dated entry at the top of `NOTES.md` and update `PROJECT_STATE.md` and
+  `NEXT_PROMPT.md` to match. Record commits, CI run IDs, exact
   build/boot results and unfinished work. Distinguish observations from guesses.
 - Commit completed changes. Use `gh` for GitHub Actions kernel builds and logs.
   Local single-file cross-compiles are useful before spending a CI run.

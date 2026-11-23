@@ -1,0 +1,11 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Read|Grep|Glob|Edit|Write|MultiEdit|NotebookEdit|Bash",
+        "hooks": [{"type": "command", "command": "python3 ~/.claude/skills/sweep/scripts/block_archive.py"}]
+      }
+    ]
+  },
+  "permissions": {"deny": ["Read(.sweep-archive/**)"]}
+}
